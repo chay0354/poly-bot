@@ -1,0 +1,4 @@
+py-clob-client==0.34.6
+websockets==16.0
+httpx[http2]==0.28.1
+python-dotenv==1.2.2

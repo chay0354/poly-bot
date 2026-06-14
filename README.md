@@ -1,0 +1,215 @@
+# Polymarket 5-Minute BTC Up/Down Bot
+
+A trading bot for Polymarket's **"Bitcoin Up or Down"** 5-minute binary markets.
+Every 300 seconds a new market opens that resolves **Up** if the Chainlink
+BTC/USD price at the window's close is ≥ its price at the open, otherwise
+**Down**. Each side is a token that pays \$1.00 if it wins, \$0.00 if it loses.
+
+The bot ships with two strategies and a built-in **paper-trading** mode so you
+can run it against live data with no money at risk.
+
+> ⚠️ **Risk warning.** These markets are essentially a coin-flip on short-term
+> BTC noise, with a bid/ask spread and (sometimes) fees working against you.
+> Paper-trade first. Only ever fund a wallet with money you can afford to lose.
+> This software is provided as-is, with no warranty. Nothing here is financial
+> advice.
+
+---
+
+## How it works
+
+```
+┌─────────────────┐   slug = btc-updown-5m-{window_start}
+│  Gamma API      │──────────────────────────────► market discovery (markets.py)
+│  (HTTP, public) │   → condition id, Up/Down token ids, tick size
+└─────────────────┘
+
+┌─────────────────────────┐  topic: crypto_prices_chainlink, symbol btc/usd
+│  ws-live-data.polymarket│──────────────────────► live price feed (pricefeed.py)
+│  (Chainlink stream, WS) │  ~1 tick/sec; THIS is the resolution source
+└─────────────────────────┘
+
+┌─────────────────┐  GET /book?token_id=...
+│  CLOB API       │──────────────────────────────► order book reads (clob.py)
+│  (HTTP, public) │  best bid / best ask per side
+└─────────────────┘
+
+┌─────────────────┐  signed FOK market orders (live mode only)
+│  CLOB API       │◄──────────────────────────────  execution (live.py)
+│  py-clob-client │
+└─────────────────┘
+```
+
+Main loop (`pm5/bot.py`), once per 5-minute window:
+
+1. **Discover** the current market from the Gamma API (deterministic slug).
+2. Check whether we **witnessed the open** — i.e. the price feed was already
+   streaming before the window started. If not, the window is treated as
+   *arbitrage-only* (we can't trust a momentum signal without the true open).
+3. Each second:
+   - **Arbitrage** — if `ask(Up) + ask(Down) ≤ 1 − edge`, buy both sides for a
+     risk-free payout. Preferred whenever available.
+   - **Momentum** — only in the closing seconds, and only if we witnessed the
+     open: if the live Chainlink price has moved far enough from the open (and
+     short-term momentum agrees), buy the side that is currently winning while
+     it is still cheaper than its \$1.00 fair value.
+4. At window close, **settle** (paper mode) against the final price and log PnL.
+
+### Why the Chainlink feed (not Binance)
+
+The market resolves against **Chainlink's BTC/USD data stream**, not Binance or
+spot. The bot subscribes to exactly that stream so its notion of "the price"
+matches the resolution source. The subscription shape lives in
+`pm5/pricefeed.py`.
+
+---
+
+## Setup
+
+Requires Python 3.9+ (developed on 3.14).
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env       # then edit .env
+```
+
+Run in **paper mode** (default — no credentials needed):
+
+```bash
+.venv/bin/python run.py
+```
+
+You'll see live market discovery, the window open price, any signals, and
+settled PnL per window.
+
+### Paper bankroll
+
+Paper mode runs against a simulated bankroll (`PM_PAPER_BANKROLL`, default
+\$100). Each trade debits its cost; each winning settlement credits the payout
+back. When the bankroll can no longer fund a trade, **the bot stops
+automatically** (`paper bankroll exhausted`). Set `PM_PAPER_BANKROLL=0` for an
+unlimited bankroll (never stops on funds). The optional `PM_DAILY_LOSS_LIMIT`
+(default 0 = off) is a separate cap that stops the bot after that much
+cumulative loss; whichever triggers first wins.
+
+### Recorded data
+
+Every run appends records to `data/trades.jsonl` (one JSON object per line,
+gitignored) for later study:
+
+- `fill` — each executed trade, with the market context at entry (strategy,
+  side, price, shares, cost, BTC price, window open, Δ, seconds left, signal).
+- `window` — each 5-minute window's outcome at settlement (open, close, winner,
+  whether it was witnessed, PnL), written even for windows with no trade — so
+  you can study what a strategy *would* have done. Includes a `path`: per-second
+  snapshots over the last `PM_PATH_SECS` (default 120s, the decision zone), each
+  `{t, btc, up, dn}` = seconds-to-close, Chainlink price, and the up/down best
+  asks. This lets you backtest both the entry *direction* (what the price showed
+  at T-30s) and the *PnL* (the ask you'd have paid). Set `PM_PATH_SECS=0` to omit.
+
+Load it for analysis:
+
+```python
+import pandas as pd
+df = pd.read_json("data/trades.jsonl", lines=True)
+fills, windows = df[df.type == "fill"], df[df.type == "window"]
+```
+
+Disable with `PM_RECORD=false`, or change the path with `PM_DATA_FILE`.
+
+### Live status line
+
+While running in a terminal, a status line redraws once per second at the
+bottom of the screen:
+
+```
+9:00AM-9:05AM ET  T- 35s  BTC 63,361.3  Δ -11.5  up 0.41/0.43 dn 0.57/0.59  pos DOWN 8.5sh  sess -5.00
+```
+
+That's the current window, seconds to close, the live Chainlink BTC price, its
+move since the window open (`Δ`, green up / red down, or `open?` when the bot
+started mid-window and didn't witness the open), the best bid/ask on each side,
+your open position, and session PnL. Event logs (signals, fills, settlement)
+scroll above it. Set `PM_LIVE_STATUS=false` to turn it off; it also auto-disables
+when output is piped to a file.
+
+---
+
+## Going live
+
+1. Fund a Polygon wallet with **USDC.e** and a little MATIC/POL for gas. If you
+   deposit via the Polymarket website (email or browser wallet), your funds sit
+   in a **proxy** — set `PM_FUNDER_ADDRESS` to that deposit address and
+   `PM_SIGNATURE_TYPE` to `1` (email/magic) or `2` (browser). If you trade
+   directly from an EOA, use `PM_SIGNATURE_TYPE=0` and leave the funder blank.
+2. Put the wallet's **private key** in `.env` as `PM_PRIVATE_KEY`. The `.env`
+   file is gitignored — never commit it.
+3. Set `PM_MODE=live`. Start with a tiny `PM_STAKE_USDC` (e.g. 1) and confirm
+   the first orders behave before sizing up.
+
+In live mode the bot derives L2 API credentials from your key on startup and
+places **Fill-or-Kill** marketable buy orders capped at a protective limit
+price. Positions settle on-chain when the market resolves.
+
+---
+
+## Configuration (`.env`)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PM_MODE` | `paper` | `paper` simulates; `live` places real orders |
+| `PM_PRIVATE_KEY` | — | Wallet private key (live only) |
+| `PM_SIGNATURE_TYPE` | `0` | 0 = EOA, 1 = email proxy, 2 = browser proxy |
+| `PM_FUNDER_ADDRESS` | — | Proxy/deposit address for sig types 1/2 |
+| `PM_STAKE_USDC` | `5` | USDC per momentum entry |
+| `PM_MAX_PRICE` | `0.85` | Don't buy a side above this price |
+| `PM_MAX_TRADES_PER_WINDOW` | `1` | Cap entries per 5-min window |
+| `PM_DAILY_LOSS_LIMIT` | `50` | Stop trading after this much paper/realized loss |
+| `PM_MOMENTUM` | `true` | Enable the momentum strategy |
+| `PM_DECIDE_WITHIN` | `45` | Only enter momentum within N s of close |
+| `PM_STOP_ENTRY` | `3` | Stop entering N s before close |
+| `PM_MIN_DELTA_USD` | `8` | Min |price − open| (USD) for momentum |
+| `PM_ARB` | `true` | Enable the arbitrage strategy |
+| `PM_ARB_MIN_EDGE` | `0.02` | Required `1 − (ask_up+ask_down)` edge |
+| `PM_ARB_STAKE_USDC` | `5` | USDC per side for arbitrage |
+| `PM_POLL_INTERVAL` | `1` | Seconds between checks |
+| `PM_LOG_LEVEL` | `INFO` | Logging verbosity |
+
+---
+
+## Project layout
+
+```
+pm5/
+  net.py        DNS bootstrap (DoH fallback) for Polymarket hosts
+  config.py     Env-driven configuration
+  markets.py    Gamma market discovery (deterministic slug)
+  pricefeed.py  Chainlink BTC/USD websocket feed
+  clob.py       Order-book reads + executor (paper/live dispatch)
+  live.py       py-clob-client order placement (live only)
+  strategy.py   Momentum + arbitrage signals
+  bot.py        Main per-window trading loop + paper settlement
+run.py          Entry point
+tests/          Offline unit tests for the strategy/settlement logic
+```
+
+### A note on DNS
+
+`pm5/net.py` resolves the Polymarket hostnames and, **only if the local
+resolver fails to resolve them**, falls back to DNS-over-HTTPS (Cloudflare) for
+those specific hosts. Traffic still goes directly over TLS with the correct
+SNI; this just works around a filtered/broken local DNS. If your DNS resolves
+`gamma-api.polymarket.com` fine, the fallback never triggers.
+
+---
+
+## Tests
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+```
+
+These cover slug/window math, paper settlement (including the risk-free
+arbitrage payout), and the momentum/arbitrage signal gating — all offline, no
+network.
