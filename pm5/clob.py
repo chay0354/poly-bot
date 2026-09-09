@@ -82,8 +82,9 @@ class Executor:
         stake_usdc: float,
         max_price: float,
         top: BookTop | None = None,
+        min_price: float = 0.0,
     ) -> Fill | None:
-        """Marketable buy up to `max_price`, spending ~`stake_usdc`.
+        """Marketable buy in [`min_price`, `max_price`], spending ~`stake_usdc`.
 
         Pass `top` to reuse an already-fetched book snapshot (avoids a second
         read and the race it creates -- important for atomic arbitrage fills).
@@ -95,6 +96,11 @@ class Executor:
             return None
         if top.best_ask > max_price:
             self.last_skip = f"ask {top.best_ask:.2f} > cap {max_price:.2f}"
+            return None
+        if top.best_ask < min_price:
+            self.last_skip = (
+                f"ask {top.best_ask:.2f} < floor {min_price:.2f} (market disagrees)"
+            )
             return None
         if self.bankroll is not None and self.bankroll < stake_usdc:
             self.last_skip = f"insufficient bankroll (${self.bankroll:.2f})"

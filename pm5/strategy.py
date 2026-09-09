@@ -30,6 +30,9 @@ class Leg:
     # Book snapshot the signal was based on, so the executor can fill against
     # the same prices without a racy re-read.
     top: "BookTop | None" = None
+    # Refuse asks below this (0 = no floor). Arb legs are cheap by design and
+    # leave it at 0; momentum uses cfg.min_price.
+    min_price: float = 0.0
 
 
 class MomentumStrategy:
@@ -71,6 +74,7 @@ class MomentumStrategy:
             token_id=market.token_for(side),
             max_price=self.cfg.max_price,
             stake_usdc=self.cfg.stake_usdc,
+            min_price=self.cfg.min_price,
         )
         return Signal(
             kind="momentum",

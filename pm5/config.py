@@ -28,9 +28,10 @@ def _b(name: str, default: bool) -> bool:
 @dataclass
 class Config:
     # --- Mode ---
-    # paper = simulate fills against the live order book, no real money.
-    # live  = sign and post real orders via the CLOB.
-    mode: str = field(default_factory=lambda: os.getenv("PM_MODE", "paper").lower())
+    # signal = shout a browser instruction (no orders, no wallet).
+    # paper  = simulate fills against the live order book, no real money.
+    # live   = sign and post real orders via the CLOB.
+    mode: str = field(default_factory=lambda: os.getenv("PM_MODE", "signal").lower())
 
     # --- Wallet / API (only needed in live mode) ---
     private_key: str = field(default_factory=lambda: os.getenv("PM_PRIVATE_KEY", ""))
@@ -48,6 +49,11 @@ class Config:
     # --- Risk / sizing ---
     stake_usdc: float = field(default_factory=lambda: _f("PM_STAKE_USDC", 5.0))
     max_price: float = field(default_factory=lambda: _f("PM_MAX_PRICE", 0.85))
+    # Momentum floor: a favored side offered *below* this in the closing seconds
+    # means the order book disagrees with our feed (the ask is cheap because the
+    # market already thinks that side is losing). Live fills at 0.01-0.32 all
+    # resolved against us; refuse them instead of treating cheap as good.
+    min_price: float = field(default_factory=lambda: _f("PM_MIN_PRICE", 0.50))
     max_trades_per_window: int = field(
         default_factory=lambda: _i("PM_MAX_TRADES_PER_WINDOW", 1)
     )
@@ -67,10 +73,10 @@ class Config:
     # Hard cutoff: stop entering this many seconds before close.
     stop_entry_secs: float = field(default_factory=lambda: _f("PM_STOP_ENTRY", 3.0))
     # Minimum |price - open| (in USD) before momentum will fire.
-    min_delta_usd: float = field(default_factory=lambda: _f("PM_MIN_DELTA_USD", 8.0))
+    min_delta_usd: float = field(default_factory=lambda: _f("PM_MIN_DELTA_USD", 25.0))
 
     # --- Arbitrage strategy ---
-    arb_enabled: bool = field(default_factory=lambda: _b("PM_ARB", True))
+    arb_enabled: bool = field(default_factory=lambda: _b("PM_ARB", False))
     # Buy both sides when (ask_up + ask_down) <= 1 - this edge (after fees).
     arb_min_edge: float = field(default_factory=lambda: _f("PM_ARB_MIN_EDGE", 0.02))
     arb_stake_usdc: float = field(default_factory=lambda: _f("PM_ARB_STAKE_USDC", 5.0))

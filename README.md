@@ -5,8 +5,9 @@ Every 300 seconds a new market opens that resolves **Up** if the Chainlink
 BTC/USD price at the window's close is ≥ its price at the open, otherwise
 **Down**. Each side is a token that pays \$1.00 if it wins, \$0.00 if it loses.
 
-The bot ships with two strategies and a built-in **paper-trading** mode so you
-can run it against live data with no money at risk.
+The bot ships with two strategies and three run modes: **signal** (default —
+prints a loud terminal alert so you click in the Polymarket browser yourself),
+**paper** (simulates fills, no money), and **live** (places real orders).
 
 > ⚠️ **Risk warning.** These markets are essentially a coin-flip on short-term
 > BTC noise, with a bid/ask spread and (sometimes) fees working against you.
@@ -74,14 +75,18 @@ python -m venv .venv
 cp .env.example .env       # then edit .env
 ```
 
-Run in **paper mode** (default — no credentials needed):
+Run in **signal mode** (default — no credentials needed). The bot watches the
+live market and, when a strategy fires, prints a loud instruction such as
+`BUY UP` / `BUY DOWN` plus the Polymarket URL. You place the trade yourself.
 
 ```bash
 .venv/bin/python run.py
 ```
 
-You'll see live market discovery, the window open price, any signals, and
-settled PnL per window.
+You'll see live market discovery, the window open price, alerts when to click,
+and (after each window) what the PnL *would* have been if you followed it.
+
+To simulate fills instead of alerting, set `PM_MODE=paper` in `.env`.
 
 ### Paper bankroll
 
@@ -152,24 +157,57 @@ In live mode the bot derives L2 API credentials from your key on startup and
 places **Fill-or-Kill** marketable buy orders capped at a protective limit
 price. Positions settle on-chain when the market resolves.
 
+A second `run.py` process is refused (`data/bot.lock`) so two copies cannot
+trade the same wallet at once.
+
+---
+
+## Deploy 24/7 on Railway
+
+This is a **long-running worker**, not a website. Do **not** deploy to Vercel.
+
+1. Push this repo to GitHub (never commit `.env`).
+2. In [Railway](https://railway.app): **New project → Deploy from GitHub repo**.
+3. Add a service from the repo. Railway will build the `Dockerfile`.
+4. Under **Variables**, copy every `PM_*` key from `.env.example`. For live:
+
+   | Variable | Typical live value |
+   |---|---|
+   | `PM_MODE` | `live` |
+   | `PM_PRIVATE_KEY` | your key (Railway secret, not git) |
+   | `PM_SIGNATURE_TYPE` | `3` for current Polymarket email/deposit wallets |
+   | `PM_FUNDER_ADDRESS` | your Polymarket profile / API address |
+   | `PM_STAKE_USDC` | `5` |
+   | `PM_MIN_PRICE` | `0.50` |
+   | `PM_MAX_PRICE` | `0.85` |
+   | `PM_MIN_DELTA_USD` | `25` |
+   | `PM_ARB` | `false` |
+   | `PM_LIVE_STATUS` | `false` |
+
+5. Use an **always-on** worker (no sleep). There is no HTTP port to bind.
+6. After deploy, logs should show `starting in LIVE mode` and `price feed connected`.
+
+If Railway offers a "web" vs **worker** process, pick worker / empty start command override so it runs `python -u run.py` from `railway.toml`.
+
 ---
 
 ## Configuration (`.env`)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PM_MODE` | `paper` | `paper` simulates; `live` places real orders |
+| `PM_MODE` | `signal` | `signal` alerts you; `paper` simulates; `live` places real orders |
 | `PM_PRIVATE_KEY` | — | Wallet private key (live only) |
-| `PM_SIGNATURE_TYPE` | `0` | 0 = EOA, 1 = email proxy, 2 = browser proxy |
-| `PM_FUNDER_ADDRESS` | — | Proxy/deposit address for sig types 1/2 |
+| `PM_SIGNATURE_TYPE` | `0` | 0 = EOA, 1 = email proxy, 2 = browser proxy, 3 = deposit wallet |
+| `PM_FUNDER_ADDRESS` | — | Proxy/deposit address for sig types 1/2/3 |
 | `PM_STAKE_USDC` | `5` | USDC per momentum entry |
 | `PM_MAX_PRICE` | `0.85` | Don't buy a side above this price |
+| `PM_MIN_PRICE` | `0.50` | Don't buy a favored side below this (cheap = book disagrees) |
 | `PM_MAX_TRADES_PER_WINDOW` | `1` | Cap entries per 5-min window |
 | `PM_DAILY_LOSS_LIMIT` | `50` | Stop trading after this much paper/realized loss |
 | `PM_MOMENTUM` | `true` | Enable the momentum strategy |
 | `PM_DECIDE_WITHIN` | `45` | Only enter momentum within N s of close |
 | `PM_STOP_ENTRY` | `3` | Stop entering N s before close |
-| `PM_MIN_DELTA_USD` | `8` | Min |price − open| (USD) for momentum |
+| `PM_MIN_DELTA_USD` | `25` | Min |price − open| (USD) for momentum |
 | `PM_ARB` | `true` | Enable the arbitrage strategy |
 | `PM_ARB_MIN_EDGE` | `0.02` | Required `1 − (ask_up+ask_down)` edge |
 | `PM_ARB_STAKE_USDC` | `5` | USDC per side for arbitrage |

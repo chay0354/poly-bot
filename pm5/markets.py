@@ -39,6 +39,10 @@ class Market:
     def token_for(self, side: str) -> str:
         return self.up_token if side.lower() == "up" else self.down_token
 
+    @property
+    def browser_url(self) -> str:
+        return f"https://polymarket.com/event/{self.slug}"
+
 
 def current_window_start(now: float | None = None) -> int:
     now = int(now if now is not None else time.time())

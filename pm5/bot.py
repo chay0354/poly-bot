@@ -75,11 +75,18 @@ class Bot:
             feed_task.cancel()
             return
         bank = self.executor.bankroll
-        log.info(
-            "starting in %s mode | stake=$%.2f | bankroll=%s",
-            self.cfg.mode.upper(), self.cfg.stake_usdc,
-            f"${bank:.2f}" if bank is not None else "unlimited",
-        )
+        if self.cfg.mode == "signal":
+            log.info(
+                "starting in SIGNAL mode | no orders | I'll shout when to click in the browser"
+            )
+        else:
+            log.info(
+                "starting in %s mode | stake=$%.2f | bankroll=%s | "
+                "momentum Δ≥$%.0f ask $%.2f–$%.2f",
+                self.cfg.mode.upper(), self.cfg.stake_usdc,
+                f"${bank:.2f}" if bank is not None else "unlimited",
+                self.cfg.min_delta_usd, self.cfg.min_price, self.cfg.max_price,
+            )
         try:
             while True:
                 if self._bankroll_exhausted():
@@ -158,7 +165,7 @@ class Bot:
                 # Momentum only when we actually saw the open; arb is always safe.
                 signal = self._pick_signal(market, witnessed, up_top, down_top)
                 if signal is not None:
-                    fills = self._execute(signal)
+                    fills = self._execute(signal, market)
                     for f in fills:
                         position.add(f)
                     if fills:
@@ -234,7 +241,9 @@ class Bot:
         seen.add(key)
         return True
 
-    def _execute(self, signal: Signal) -> list[Fill]:
+    def _execute(self, signal: Signal, market: Market | None = None) -> list[Fill]:
+        if self.cfg.mode == "signal":
+            return self._announce_signal(signal, market)
         if signal.kind == "arb":
             return self._execute_arb(signal)
         side = signal.legs[0].side
@@ -242,7 +251,10 @@ class Bot:
             log.info("SIGNAL[%s] %s", signal.kind, signal.reason)
         fills: list[Fill] = []
         for leg in signal.legs:
-            fill = self.executor.buy(leg.token_id, leg.side, leg.stake_usdc, leg.max_price, leg.top)
+            fill = self.executor.buy(
+                leg.token_id, leg.side, leg.stake_usdc, leg.max_price, leg.top,
+                min_price=leg.min_price,
+            )
             if fill is not None:
                 fills.append(fill)
             elif self.executor.last_skip and self._should_log(
@@ -250,6 +262,67 @@ class Bot:
             ):
                 log.info("  ↳ %s not taken: %s (still trying)", leg.side, self.executor.last_skip)
         return fills
+
+    def _announce_signal(self, signal: Signal, market: Market | None) -> list[Fill]:
+        """Print a one-shot browser instruction. No order is placed."""
+        fills: list[Fill] = []
+        actions: list[str] = []
+        url = market.browser_url if market is not None else ""
+        left = f"{market.seconds_left:.0f}" if market is not None else "?"
+
+        if signal.kind == "arb":
+            for leg in signal.legs:
+                ask = self._leg_ask(leg)
+                if ask is None:
+                    if self._should_log(f"sig-skip:{leg.side}:no-ask"):
+                        log.info("signal skipped: no ask on %s", leg.side)
+                    return []
+                actions.append(f"BUY {leg.side.upper()}   pay {ask:.2f} or less")
+                fills.append(self._virtual_fill(leg, ask))
+        else:
+            leg = signal.legs[0]
+            ask = self._leg_ask(leg)
+            if ask is None:
+                if self._should_log(f"sig-skip:{leg.side}:no-ask"):
+                    log.info("signal skipped: no ask on %s (still watching)", leg.side)
+                return []
+            if ask > leg.max_price:
+                if self._should_log(f"sig-skip:{leg.side}:cap"):
+                    log.info(
+                        "signal skipped: %s ask %.2f > cap %.2f (still watching)",
+                        leg.side, ask, leg.max_price,
+                    )
+                return []
+            if ask < leg.min_price:
+                if self._should_log(f"sig-skip:{leg.side}:floor"):
+                    log.info(
+                        "signal skipped: %s ask %.2f < floor %.2f, market disagrees "
+                        "(still watching)",
+                        leg.side, ask, leg.min_price,
+                    )
+                return []
+            actions.append(f"BUY {leg.side.upper()}   pay {ask:.2f} or less")
+            fills.append(self._virtual_fill(leg, ask))
+
+        body = "\n".join(f"  {line}" for line in actions)
+        extra = f"  then HOLD until the window ends (do not SELL)\n  {left}s left"
+        if url:
+            extra += f"\n  {url}"
+        bar = "=" * 62
+        log.info("\n%s\n%s\n%s\n%s\a", bar, body, extra, bar)
+        return fills
+
+    def _leg_ask(self, leg) -> float | None:
+        if leg.top is not None and leg.top.best_ask is not None:
+            return leg.top.best_ask
+        top = self.reader.top(leg.token_id)
+        return top.best_ask
+
+    @staticmethod
+    def _virtual_fill(leg, ask: float) -> Fill:
+        shares = round(leg.stake_usdc / ask, 2)
+        cost = round(shares * ask, 4)
+        return Fill(leg.token_id, leg.side, ask, shares, cost, paper=True)
 
     def _execute_arb(self, signal: Signal) -> list[Fill]:
         """All-or-none: only fill if every leg is still fillable at signal price.
@@ -325,9 +398,11 @@ class Bot:
             self.day_pnl += window_pnl
             # Return the payout (winning shares * $1 = cost + pnl) to the bankroll.
             self._credit_bankroll(position.cost + window_pnl)
+            prefix = "if you entered, " if self.cfg.mode == "signal" else ""
             log.info(
-                "SETTLE %s won | open=%.1f close=%.1f | window PnL=%+.2f | session=%+.2f | bankroll=%s",
-                "UP" if up_won else "DOWN", open_price, close_price, window_pnl, self.session_pnl,
+                "SETTLE %s won | open=%.1f close=%.1f | %swindow PnL=%+.2f | session=%+.2f | bankroll=%s",
+                "UP" if up_won else "DOWN", open_price, close_price, prefix,
+                window_pnl, self.session_pnl,
                 f"${self.executor.bankroll:.2f}" if self.executor.bankroll is not None else "∞",
             )
 

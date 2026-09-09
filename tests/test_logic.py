@@ -27,6 +27,8 @@ def make_market(seconds_left=30) -> Market:
 
 def test_slug_format():
     assert slug_for(1781263200) == "btc-updown-5m-1781263200"
+    m = make_market()
+    assert m.browser_url.startswith("https://polymarket.com/event/btc-updown-5m-")
 
 
 def test_window_alignment():
@@ -407,6 +409,50 @@ def test_bankroll_debits_on_fill_and_blocks_when_empty():
     assert "insufficient bankroll" in ex.last_skip
 
 
+def test_momentum_refuses_cheap_ask_when_book_disagrees():
+    """A favored side offered at 0.01-0.32 in the closing seconds is the side
+    the book already thinks is losing; the floor must refuse it."""
+    from pm5.clob import Executor
+
+    cfg = Config()
+    cfg.mode = "paper"
+    cfg.paper_bankroll = 0.0
+    ex = Executor(cfg, reader=None)
+
+    f = ex.buy("UP", "up", stake_usdc=5.0, max_price=0.85, top=_book(0.28), min_price=0.50)
+    assert f is None
+    assert "floor" in ex.last_skip and "market disagrees" in ex.last_skip
+
+    # Inside the band the buy goes through.
+    f = ex.buy("UP", "up", stake_usdc=5.0, max_price=0.85, top=_book(0.62), min_price=0.50)
+    assert f is not None and f.price == 0.62
+
+    # No floor (arb legs) keeps the old behaviour.
+    f = ex.buy("UP", "up", stake_usdc=5.0, max_price=0.85, top=_book(0.28))
+    assert f is not None
+
+
+def test_momentum_leg_carries_floor_from_config():
+    cfg = Config()
+    cfg.min_price = 0.55
+    cfg.min_delta_usd = 8.0
+    feed = ChainlinkFeed("wss://x", "x")
+    m = make_market(seconds_left=30)
+    now_ms = int(time.time() * 1000)
+    feed._ingest(
+        '{"topic":"crypto_prices_chainlink","payload":{"symbol":"btc/usd",'
+        f'"value":100000,"timestamp":{(m.window_start + 1) * 1000}}}}}'
+    )
+    feed._ingest(
+        '{"topic":"crypto_prices_chainlink","payload":{"symbol":"btc/usd",'
+        f'"value":100050,"timestamp":{now_ms}}}}}'
+    )
+    sig = MomentumStrategy(cfg, feed).evaluate(m)
+    assert sig is not None
+    assert sig.legs[0].side == "up"
+    assert sig.legs[0].min_price == 0.55
+
+
 def test_bankroll_unlimited_when_zero():
     from pm5.clob import Executor
 
@@ -464,6 +510,65 @@ def test_bankroll_exhausted_stop_condition():
     assert bot._bankroll_exhausted() is True
     bot.executor.bankroll = 5.0
     assert bot._bankroll_exhausted() is False
+
+
+def test_signal_mode_announces_and_does_not_buy(caplog):
+    from pm5.strategy import Leg, Signal
+
+    cfg = Config()
+    cfg.mode = "signal"
+    cfg.max_price = 0.85
+    bot = Bot.__new__(Bot)
+    bot.cfg = cfg
+    bot._window_logged = set()
+    bot.reader = _ReaderStub(up_ask=0.62, down_ask=0.40)
+
+    bought = []
+
+    class _Exec:
+        last_skip = None
+        bankroll = None
+
+        def buy(self, *a, **k):
+            bought.append(True)
+            raise AssertionError("signal mode must not place orders")
+
+    bot.executor = _Exec()
+    market = make_market(seconds_left=28)
+    sig = Signal(
+        kind="momentum",
+        legs=[Leg("up", "UP", 0.85, 5, None)],
+        reason="Δopen=+12.0 USD, 28s left",
+    )
+
+    with caplog.at_level(logging.INFO, logger="pm5.bot"):
+        fills = bot._execute(sig, market)
+
+    assert bought == []
+    assert len(fills) == 1
+    assert fills[0].side == "up" and fills[0].paper is True
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert "BUY UP" in msg
+    assert "0.62" in msg
+    assert "do not SELL" in msg
+    assert market.browser_url in msg
+
+
+def test_signal_mode_skips_when_ask_above_cap(caplog):
+    from pm5.strategy import Leg, Signal
+
+    cfg = Config()
+    cfg.mode = "signal"
+    bot = Bot.__new__(Bot)
+    bot.cfg = cfg
+    bot._window_logged = set()
+    bot.reader = _ReaderStub(up_ask=0.92, down_ask=0.10)
+    bot.executor = type("E", (), {"last_skip": None, "bankroll": None})()
+
+    sig = Signal(kind="momentum", legs=[Leg("up", "UP", 0.85, 5, None)], reason="x")
+    with caplog.at_level(logging.INFO, logger="pm5.bot"):
+        assert bot._execute(sig, make_market()) == []
+    assert any("ask 0.92 > cap 0.85" in r.getMessage() for r in caplog.records)
 
 
 def test_pos_summary_groups_by_side():
