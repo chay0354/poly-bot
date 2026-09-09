@@ -124,7 +124,11 @@ class Config:
     # Still naked after this many seconds *and* the pair cannot close at the
     # hard cap: sell the filled leg at the bid instead of holding $stake to
     # resolution. 0 = never sell-to-exit.
-    maker_exit_secs: float = field(default_factory=lambda: _f("PM_MAKER_EXIT_SECS", 20.0))
+    maker_exit_secs: float = field(default_factory=lambda: _f("PM_MAKER_EXIT_SECS", 30.0))
+    # Don't wait for the timer once the market has decided against our leg:
+    # exit as soon as our side's bid is this far under our fill (0 = timer
+    # only). Selling at 0.42 beats selling at 0.31 twenty seconds later.
+    maker_stop_ticks: float = field(default_factory=lambda: _f("PM_MAKER_STOP", 0.04))
     # Don't dump into a dust bid; hold if the best bid is below this.
     maker_exit_min_bid: float = field(default_factory=lambda: _f("PM_MAKER_EXIT_MIN_BID", 0.10))
 

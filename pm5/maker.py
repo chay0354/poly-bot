@@ -293,40 +293,75 @@ class MakerPair:
     def exit_signal(
         self, up_top: BookTop | None, down_top: BookTop | None,
     ) -> Signal | None:
-        """Sell a stuck naked leg at the bid after the hard pair window.
+        """Get out of a stuck naked leg.
 
-        Caller must try complete_pair first. We only fire when the other ask
-        never came back inside the hard cap — holding to resolution is then a
-        $stake coin flip; a bid sale is a known (usually smaller) loss.
+        Caller must try complete_pair first (that is the ≤ $1.00 lock). We
+        fire when the timer runs out *or* our side's bid has already fallen
+        `maker_stop_ticks` under the fill — the market decided, waiting only
+        makes the bid worse (17:00: 0.42 → 0.38 in 20s). Then take the
+        cheaper of selling at the bid and buying the other side as a taker.
         """
         if self.hedged or self.exited or self.cfg.maker_exit_secs <= 0:
             return None
         side = self.naked_side
         if side is None or self._naked_since is None:
             return None
-        age = self._clock() - self._naked_since
-        if age < self.cfg.maker_exit_secs:
-            return None
         top = up_top if side == "up" else down_top
         if top is None or top.best_bid is None:
             return None
-        if top.best_bid < self.cfg.maker_exit_min_bid:
+        avg = self._avg_price(side)
+        if avg is None:
             return None
+        bid = top.best_bid
+        age = self._clock() - self._naked_since
+        stop = self.cfg.maker_stop_ticks
+        decided = stop > 0 and bid <= avg - stop + 1e-9
+        if age < self.cfg.maker_exit_secs and not decided:
+            return None
+        if bid < self.cfg.maker_exit_min_bid:
+            return None
+        why = f"bid {bid:.2f} ≤ fill {avg:.2f}−{stop:.2f}" if decided else f"after {age:.0f}s"
         qty = self.naked_shares
+
+        # Two ways out; take the cheaper. Buying the other side locks $1 per
+        # pair, so its loss is (avg + ask + fee − 1); selling ours costs
+        # (avg − bid). Near the open the two are often within a few cents.
+        other = "down" if side == "up" else "up"
+        other_top = down_top if other == "down" else up_top
+        sell_pnl = qty * (bid - avg)
+        if other_top is not None and other_top.best_ask is not None:
+            ask = other_top.best_ask
+            fee = taker_fee_usdc(1.0, ask, self.cfg.taker_fee_rate)
+            all_in = avg + ask + fee
+            if qty * (1.0 - all_in) > sell_pnl + 1e-9:
+                leftover = self.orders.get(other)
+                if leftover is not None and not leftover.done:
+                    self._cancel_one(leftover, "exit via pair")
+                return Signal(
+                    kind="maker-pair",
+                    legs=[Leg(
+                        side=other,
+                        token_id=self.market.token_for(other),
+                        max_price=ask,
+                        stake_usdc=round(qty * ask, 2),
+                        top=other_top,
+                    )],
+                    reason=(
+                        f"exit naked {side} via pair ({why}): {avg:.2f} + {other} ask "
+                        f"{ask:.2f} + fee {fee:.3f} = {all_in:.3f}, beats selling @ {bid:.2f}"
+                    ),
+                )
         return Signal(
             kind="maker-exit",
             legs=[Leg(
                 side=side,
                 token_id=self.market.token_for(side),
-                max_price=top.best_bid,
-                stake_usdc=round(qty * top.best_bid, 2),
+                max_price=bid,
+                stake_usdc=round(qty * bid, 2),
                 top=top,
                 shares=qty,
             )],
-            reason=(
-                f"exit naked {side} {qty:.1f}sh @ bid {top.best_bid:.2f} "
-                f"after {age:.0f}s (pair never closed)"
-            ),
+            reason=f"exit naked {side} {qty:.1f}sh @ bid {bid:.2f} ({why}, pair never closed)",
         )
 
     def mark_hedged(self, fills: list[Fill]) -> None:

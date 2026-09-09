@@ -519,18 +519,20 @@ def test_maker_exit_sells_naked_leg_after_hard_window():
     cfg.maker_pair_hard_sum = 1.12
     cfg.maker_exit_secs = 20
     cfg.maker_exit_min_bid = 0.10
+    cfg.maker_stop_ticks = 0  # timer-only for this scenario
     now = {"t": 1000.0}
     mk._clock = lambda: now["t"]
     mk.step(_book(0.52), _book(0.52))
     mk.step(_book(0.60), _book(0.46))  # Down hit; Up ask 0.60 -> sum 1.06
-    expensive_up = _book(0.70, bid=0.28)
-    cheap_dn = _book(0.90, bid=0.28)
+    # Up 0.74 + 0.46 + fee = 1.21 loses more than selling Down at 0.28 (0.18).
+    expensive_up = _book(0.74, bid=0.72)
+    cheap_dn = _book(0.30, bid=0.28)
     assert mk.complete_pair_signal(expensive_up, cheap_dn) is None
     assert mk.exit_signal(expensive_up, cheap_dn) is None
     now["t"] += 19
     assert mk.exit_signal(expensive_up, cheap_dn) is None
     now["t"] += 1
-    # Pair still cannot close at 1.12 (0.46+0.70); sell Down at 0.28.
+    # Pair still cannot close at 1.12 (0.46+0.74); sell Down at 0.28.
     assert mk.complete_pair_signal(expensive_up, cheap_dn) is None
     sig = mk.exit_signal(expensive_up, cheap_dn)
     assert sig is not None and sig.kind == "maker-exit"
@@ -543,6 +545,43 @@ def test_maker_exit_sells_naked_leg_after_hard_window():
     # Leftover Up bid is gone; no second entry.
     assert mk.orders["up"].done
     assert mk.step(_book(0.40), _book(0.40)) == []
+
+
+def test_maker_exit_stops_early_when_market_decides_against_leg():
+    """17:00: Up filled 0.46, bid drifted 0.42 -> 0.38 while we waited 20s."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_exit_secs = 30
+    cfg.maker_stop_ticks = 0.04
+    now = {"t": 1000.0}
+    mk._clock = lambda: now["t"]
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.46), _book(0.56))  # Up hit @ 0.46
+    now["t"] += 5
+    # Undecided (bid 0.44): keep waiting for the pair.
+    assert mk.exit_signal(_book(0.46, bid=0.44), _book(0.56)) is None
+    # Bid 0.42 = fill − 0.04: decided. Down ask 0.62 → pair 0.46+0.62+fee ≈ 1.10
+    # loses more than selling at 0.42 → sell now, not at T+30s.
+    sig = mk.exit_signal(_book(0.44, bid=0.42), _book(0.62))
+    assert sig is not None and sig.kind == "maker-exit"
+    assert sig.legs[0].max_price == 0.42 and sig.legs[0].shares == 10.87
+
+
+def test_maker_exit_prefers_cheaper_pair_completion():
+    cfg, ex, m, mk = _maker()
+    cfg.maker_exit_secs = 30
+    cfg.maker_stop_ticks = 0.04
+    now = {"t": 1000.0}
+    mk._clock = lambda: now["t"]
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.46), _book(0.56))  # Up hit @ 0.46
+    now["t"] += 31
+    # Timer fired. Selling Up at 0.40 loses 0.06/sh; buying Down at 0.53
+    # (+fee 0.017) loses 0.007/sh and locks the pair. Take the pair.
+    sig = mk.exit_signal(_book(0.42, bid=0.40), _book(0.53))
+    assert sig is not None and sig.kind == "maker-pair"
+    assert sig.legs[0].side == "down" and sig.legs[0].max_price == 0.53
+    # The leftover Down maker bid was pulled so the taker buy can't double-fill.
+    assert mk.orders["down"].done
 
 
 def test_paper_sell_nets_position_and_credits_bankroll():
