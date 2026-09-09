@@ -6,6 +6,8 @@ Isolated here so paper/signal mode never imports signing code or needs a key.
 from __future__ import annotations
 
 import logging
+import re
+import time
 
 from py_clob_client_v2 import (
     ClobClient,
@@ -35,7 +37,28 @@ class LiveTrader:
             kwargs["funder"] = cfg.funder_address
         self.client = ClobClient(**kwargs)
         self.client.set_api_creds(self.client.create_or_derive_api_key())
+        # After a "not enough balance" reject, stop hammering the CLOB twice
+        # a second (20:16 UTC: 60 rejects in a minute). Retry after a pause.
+        self._low_balance_until = 0.0
         log.info("live trader ready (sig_type=%s funder=%s)", cfg.signature_type, bool(cfg.funder_address))
+
+    LOW_BALANCE_PAUSE = 60.0
+
+    def _note_reject(self, e: Exception, want_usdc: float) -> None:
+        text = str(e)
+        if "not enough balance" not in text:
+            return
+        m = re.search(r"balance:\s*(\d+)", text)
+        have = int(m.group(1)) / 1e6 if m else None
+        self._low_balance_until = time.monotonic() + self.LOW_BALANCE_PAUSE
+        log.warning(
+            "[LIVE] wallet too low to rest a bid: have $%s, need $%.2f. Deposit USDC or "
+            "claim resolved winnings; pausing orders for %.0fs",
+            f"{have:.2f}" if have is not None else "?", want_usdc, self.LOW_BALANCE_PAUSE,
+        )
+
+    def _paused(self) -> bool:
+        return time.monotonic() < self._low_balance_until
 
     def buy(self, token_id: str, side: str, price: float, shares: float) -> Fill | None:
         """Fill-or-Kill marketable buy. `price` is the protective limit."""
@@ -59,7 +82,10 @@ class LiveTrader:
                 order_type=OrderType.FOK,
             )
         except Exception as e:  # noqa: BLE001
-            log.error("[LIVE] order failed for %s: %s", side, e)
+            if "not enough balance" in str(e):
+                self._note_reject(e, amount)
+            else:
+                log.error("[LIVE] order failed for %s: %s", side, e)
             return None
 
         if not isinstance(resp, dict):
@@ -119,6 +145,8 @@ class LiveTrader:
         tick_size: float, neg_risk: bool,
     ) -> RestingOrder | None:
         """Rest a post-only GTC bid (maker: 0% fee). Rejected if it would cross."""
+        if self._paused():
+            return None
         args = OrderArgsV2(token_id=token_id, price=price, size=shares, side=Side.BUY)
         opts = PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=neg_risk)
         try:
@@ -126,7 +154,10 @@ class LiveTrader:
                 args, options=opts, order_type=OrderType.GTC, post_only=True
             )
         except Exception as e:  # noqa: BLE001
-            log.error("[LIVE] rest bid failed for %s @ %.2f: %s", side, price, e)
+            if "not enough balance" in str(e):
+                self._note_reject(e, shares * price)
+            else:
+                log.error("[LIVE] rest bid failed for %s @ %.2f: %s", side, price, e)
             return None
         if not isinstance(resp, dict):
             log.error("[LIVE] unexpected response resting %s: %s", side, resp)
