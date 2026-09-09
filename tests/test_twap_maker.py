@@ -391,6 +391,29 @@ def test_maker_does_not_post_when_feed_already_moved():
     assert mk.orders == {} and not mk.posted
 
 
+def test_maker_rests_full_pair_after_an_unposted_spike_fades():
+    """16:25/16:30: Δ spiked before we rested; we then sat out the window."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_defensive_usd = 20
+    mk.step(_book(0.52), _book(0.52), btc=50069.0, open_price=50000.0)
+    assert mk.orders == {} and not mk._stood_down and mk._blocked == set()
+    # Back inside the hysteresis band (< 15): rest BOTH sides, never one.
+    mk.step(_book(0.52), _book(0.52), btc=50010.0, open_price=50000.0)
+    assert set(mk.orders) == {"up", "down"} and mk.posted
+
+
+def test_maker_exit_sells_exact_naked_shares():
+    cfg, ex, m, mk = _maker()
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.46), _book(0.56))  # Up hit: 10.87 sh
+    mk._naked_since = mk._clock() - 30
+    sig = mk.exit_signal(_book(0.44, bid=0.42), _book(0.60))
+    assert sig is not None and sig.legs[0].shares == 10.87
+    # stake/price re-rounding gives 10.88 -> the CLOB rejects that.
+    leg = sig.legs[0]
+    assert round(leg.stake_usdc / leg.max_price, 2) == 10.88
+
+
 def test_maker_steps_under_a_low_ask_instead_of_sitting_out():
     """12:00 ET at T+3s: book 0.45/0.56. Rest Up @0.44 + Down @0.46 (=0.90)."""
     cfg, ex, m, mk = _maker()
@@ -424,10 +447,14 @@ def test_maker_defensive_line_scales_with_realized_vol():
     assert mk.orders["down"].done and mk.orders["up"].done
 
 
-def test_realized_vol_scales_to_horizon():
-    f = _feed_with([(0, 100.0), (50, 110.0), (100, 100.0), (150, 110.0), (200, 100.0)])
-    # 4 moves of 10 over 200s → rv=400 → scaled to 300s: sqrt(600)
-    assert abs(f.realized_vol(300) - 600 ** 0.5) < 1e-6
+def test_realized_vol_is_trailing_range():
+    f = _feed_with([(0, 100.0), (50, 110.0), (100, 100.0), (150, 130.0), (200, 100.0)])
+    assert f.realized_vol(300) == 30.0
+    # Only the last 60s: ticks at 150 (130) and 200 (100).
+    assert f.realized_vol(60) == 30.0
+    # Trending tape of tiny ticks still reads as the full travel.
+    f = _feed_with([(i, 100.0 + i) for i in range(0, 300, 1)])
+    assert f.realized_vol(300) == 299.0
     # Not enough history for the horizon → None.
     assert f.realized_vol(1000) is None
 

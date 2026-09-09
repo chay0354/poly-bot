@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 
 import httpx
@@ -327,7 +328,12 @@ class Bot:
             log.info("SIGNAL[%s] %s", signal.kind, signal.reason)
         fills: list[Fill] = []
         for leg in signal.legs:
-            shares = round(leg.stake_usdc / leg.max_price, 2) if leg.max_price else 0.0
+            if leg.shares > 0:
+                shares = leg.shares
+            else:
+                shares = leg.stake_usdc / leg.max_price if leg.max_price else 0.0
+            # Never round up: selling 10.88 when we hold 10.87 is a hard reject.
+            shares = math.floor(shares * 100 + 1e-9) / 100
             fill = self.executor.sell(
                 leg.token_id, leg.side, shares, min_price=leg.max_price, top=leg.top,
             )

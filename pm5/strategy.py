@@ -33,6 +33,9 @@ class Leg:
     # Refuse asks below this (0 = no floor). Arb legs are cheap by design and
     # leave it at 0; momentum uses cfg.min_price.
     min_price: float = 0.0
+    # Exact share count for sells. Deriving it from stake/price re-rounds
+    # 10.87 into 10.88 and the CLOB rejects "not enough balance".
+    shares: float = 0.0
 
 
 class MomentumStrategy:

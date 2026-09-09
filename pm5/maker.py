@@ -115,8 +115,6 @@ class MakerPair:
             and left > self._keep_bid_left
         ):
             toxic = self._toxic_side(btc, open_price)
-            if toxic is not None:
-                self._blocked.add(toxic)
             already_in = bool(self.fills or self._live_orders())
             if self._stood_down and not self.fills:
                 self._skip = "stood down after defensive yank"
@@ -323,6 +321,7 @@ class MakerPair:
                 max_price=top.best_bid,
                 stake_usdc=round(qty * top.best_bid, 2),
                 top=top,
+                shares=qty,
             )],
             reason=(
                 f"exit naked {side} {qty:.1f}sh @ bid {top.best_bid:.2f} "
@@ -363,22 +362,29 @@ class MakerPair:
         if toxic is None:
             return found
         delta = btc - open_price
-        self._blocked.add(toxic)
         if not self.fills:
             live = [o for o in self.orders.values() if not o.done]
-            if live:
-                log.info(
-                    "maker: defensive cancel pair (BTC Δopen=%+.1f ≥ %.0f, nothing filled)",
-                    delta, self._limit,
-                )
+            if not live:
+                # Nothing resting, nothing to protect. Do NOT block the side:
+                # if the move fades we want to rest the full pair, not one leg.
+                return found
+            log.info(
+                "maker: defensive cancel pair (BTC Δopen=%+.1f ≥ %.0f, nothing filled)",
+                delta, self._limit,
+            )
             for o in live:
                 fill = self._cancel_one(o, "defensive pair")
                 if fill is not None:
                     found.append(fill)
                 self._blocked.add(o.side)
+            # Sit out only if we actually yanked a pair. A Δ spike while
+            # nothing was resting is handled by the hysteresis in
+            # _toxic_side; standing down there cost two whole windows (16:25,
+            # 16:30) for a move that faded.
             if not found:
                 self._stood_down = True
             return found
+        self._blocked.add(toxic)
         if self.shares(toxic) > 0.01:
             return found
         order = self.orders.get(toxic)

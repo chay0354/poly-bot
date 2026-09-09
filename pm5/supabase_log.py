@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -137,10 +138,14 @@ class SupabaseLog:
             "result": classify(traded, pnl),
             "strategies": strategies or [],
         }
-        try:
-            self._sb.table("windows").upsert(row, on_conflict="mode,window_slug").execute()
-            log.info("supabase window %s %s pnl=%s", row.get("window_slug"), row.get("result"), row.get("estimated_pnl"))
-            return True
-        except Exception as e:  # noqa: BLE001
-            log.warning("supabase window write failed: %s", e)
-            return False
+        # One retry: a PostgREST gateway timeout (16:25) lost a settled window.
+        for attempt in (1, 2):
+            try:
+                self._sb.table("windows").upsert(row, on_conflict="mode,window_slug").execute()
+                log.info("supabase window %s %s pnl=%s", row.get("window_slug"), row.get("result"), row.get("estimated_pnl"))
+                return True
+            except Exception as e:  # noqa: BLE001
+                log.warning("supabase window write failed (try %d): %s", attempt, e)
+                if attempt == 1:
+                    time.sleep(1.5)
+        return False
