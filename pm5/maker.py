@@ -135,10 +135,12 @@ class MakerPair:
             elif already_in and not self.posted:
                 # One leg is on / filled: always retry the missing bid, even
                 # if the book has gone one-sided (that is how we get stuck naked).
-                self._post()
-            elif not self.posted and left > self.cfg.maker_cancel_left_secs:
+                self._post(tops, relax=True)
+            elif not self.posted and left <= self.cfg.maker_cancel_left_secs:
+                self._skip = f"joined too late (T-{left:.0f}s)"
+            elif not self.posted:
                 if self._book_undecided(tops):
-                    self._post()
+                    self._post(tops)
                 else:
                     self._skip = f"book one-sided (up {_fmt(up_top)}, down {_fmt(down_top)})"
                     if not self._warned_onesided:
@@ -443,7 +445,7 @@ class MakerPair:
         the point where the other side has become cheap.
         """
         tick = self.market.tick_size or 0.01
-        lo = self.cfg.maker_bid + tick          # post-only must not cross
+        lo = self._bid_floor() + tick           # post-only must not cross
         hi = 1.0 - self.cfg.maker_bid + 0.08    # e.g. 0.62 for a 0.46 bid
         for side in ("up", "down"):
             top = tops.get(side)
@@ -452,6 +454,28 @@ class MakerPair:
             if not (lo <= top.best_ask <= hi):
                 return False
         return True
+
+    def _bid_floor(self) -> float:
+        return round(self.cfg.maker_bid - max(self.cfg.maker_bid_give, 0.0), 2)
+
+    def _bid_for(
+        self, side: str, tops: dict[str, BookTop | None], relax: bool = False,
+    ) -> float | None:
+        """Price to rest on `side`: our bid, or one tick under a lower ask.
+
+        None if even the floor would cross (that side has already collapsed).
+        `relax` drops the floor: when the other leg is already on, a cheap
+        complement is a cheaper pair, not a collapsed side to avoid.
+        """
+        px = self.cfg.maker_bid
+        tick = self.market.tick_size or 0.01
+        top = tops.get(side)
+        if top is not None and top.best_ask is not None and top.best_ask <= px:
+            px = round(top.best_ask - tick, 2)
+        floor = self.cfg.maker_exit_min_bid if relax else self._bid_floor()
+        if px < floor:
+            return None
+        return px
 
     def _avg_price(self, side: str) -> float | None:
         sf = [f for f in self.fills if f.side == side and f.size > 0]
@@ -471,7 +495,7 @@ class MakerPair:
         order = self.orders.get(side)
         return order is not None and not order.done
 
-    def _post(self) -> None:
+    def _post(self, tops: dict[str, BookTop | None], relax: bool = False) -> None:
         """Rest any missing bid. Only mark posted once BOTH sides are on the book.
 
         A CLOB/network reject must not burn the rest of the window: we retry
@@ -480,7 +504,6 @@ class MakerPair:
         """
         m = self.market
         tick = m.tick_size or 0.01
-        px = self.cfg.maker_bid
         shares = self._wanted_shares()
         attempted = 0
         for side in ("up", "down"):
@@ -491,6 +514,9 @@ class MakerPair:
             existing = self.orders.get(side)
             if existing is not None and not existing.done:
                 continue
+            px = self._bid_for(side, tops, relax)
+            if px is None:
+                continue  # that side's ask is under our floor; retry next tick
             attempted += 1
             order = self.executor.place_bid(
                 m.token_for(side), side, px, shares, tick, m.neg_risk,

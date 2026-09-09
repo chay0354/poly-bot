@@ -391,6 +391,19 @@ def test_maker_does_not_post_when_feed_already_moved():
     assert mk.orders == {} and not mk.posted
 
 
+def test_maker_steps_under_a_low_ask_instead_of_sitting_out():
+    """12:00 ET at T+3s: book 0.45/0.56. Rest Up @0.44 + Down @0.46 (=0.90)."""
+    cfg, ex, m, mk = _maker()
+    mk.step(_book(0.45), _book(0.56))
+    assert mk.posted
+    assert mk.orders["up"].price == 0.44 and mk.orders["down"].price == 0.46
+    assert mk.orders["up"].size == mk.orders["down"].size == 10.87
+    # Below the floor (0.42) that side has collapsed: still sit out.
+    cfg, ex, m, mk = _maker()
+    mk.step(_book(0.41), _book(0.60))
+    assert not mk.posted and mk.orders == {}
+
+
 def test_maker_defensive_line_scales_with_realized_vol():
     """9 Sep: BTC swung $300+/window; a fixed $20 line kept us out all hour."""
     cfg, ex, m, mk = _maker()

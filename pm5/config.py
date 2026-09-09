@@ -93,6 +93,10 @@ class Config:
     maker_enabled: bool = field(default_factory=lambda: _b("PM_MAKER", False))
     maker_bid: float = field(default_factory=lambda: _f("PM_MAKER_BID", 0.46))
     maker_stake_usdc: float = field(default_factory=lambda: _f("PM_MAKER_STAKE_USDC", 5.0))
+    # If a side is already offered at/below our bid (book 0.45/0.56 at T+3s),
+    # rest that side one tick under its ask instead of sitting out, down to
+    # bid − give (0.42 for 0.46). The pair then costs ≤ 0.92, never more.
+    maker_bid_give: float = field(default_factory=lambda: _f("PM_MAKER_BID_GIVE", 0.04))
     # Post the bids this many seconds after the window opens (let the book form).
     # 10s was too late on a fast tape: by then the book has tilted and BTC has
     # moved past the defensive line, so we never rested at all (9 Sep session).
