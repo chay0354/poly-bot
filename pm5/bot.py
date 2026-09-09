@@ -20,6 +20,7 @@ import httpx
 from . import net
 from .clob import BookReader, Executor, Fill
 from .config import Config
+from .maker import MakerPair
 from .markets import Market, MarketDiscovery, current_window_start
 from .pricefeed import ChainlinkFeed
 from .recorder import Recorder
@@ -82,10 +83,14 @@ class Bot:
         else:
             log.info(
                 "starting in %s mode | stake=$%.2f | bankroll=%s | "
-                "momentum Δ≥$%.0f ask $%.2f–$%.2f",
+                "momentum TWAP%.0fs Δ≥$%.0f flip≥$%.0f ask $%.2f–$%.2f | maker %s",
                 self.cfg.mode.upper(), self.cfg.stake_usdc,
                 f"${bank:.2f}" if bank is not None else "unlimited",
-                self.cfg.min_delta_usd, self.cfg.min_price, self.cfg.max_price,
+                self.cfg.twap_secs, self.cfg.min_delta_usd, self.cfg.min_flip_usd,
+                self.cfg.min_price, self.cfg.max_price,
+                (f"ON bid {self.cfg.maker_bid:.2f}×2 ${self.cfg.maker_stake_usdc:.0f}/side, "
+                 f"hedge≤{self.cfg.maker_hedge_max_price:.2f}")
+                if self.cfg.maker_enabled else "off",
             )
         try:
             while True:
@@ -110,6 +115,8 @@ class Bot:
             costs.append(self.cfg.stake_usdc)
         if self.cfg.arb_enabled:
             costs.append(2 * self.cfg.arb_stake_usdc)  # arb needs both legs
+        if self.cfg.maker_enabled:
+            costs.append(2 * self.cfg.maker_stake_usdc)  # both bids may fill
         return min(costs) if costs else self.cfg.stake_usdc
 
     def _bankroll_exhausted(self) -> bool:
@@ -132,49 +139,81 @@ class Bot:
         open_price: float | None = None
         path: list[dict] = []  # price/quote snapshots over the decision zone
         self._window_logged = set()  # dedup repetitive attempt logs within a window
+        maker = (
+            MakerPair(self.cfg, self.executor, market)
+            if self.cfg.maker_enabled and self.cfg.mode != "signal" else None
+        )
 
-        while market.seconds_left > 0:
-            if current_window_start() != ws:
-                break  # rolled into the next window
+        try:
+            while market.seconds_left > 0:
+                if current_window_start() != ws:
+                    break  # rolled into the next window
 
-            if witnessed and open_price is None:
-                open_price = self.feed.price_at_or_after(market.window_start)
-                if open_price is not None:
-                    log.info("window open price ≈ %.1f", open_price)
+                if witnessed and open_price is None:
+                    open_price = self.feed.price_at_or_after(market.window_start)
+                    if open_price is not None:
+                        log.info("window open price ≈ %.1f", open_price)
 
-            secs_left = market.seconds_left
-            sampling = (
-                self.cfg.record and self.cfg.path_secs > 0 and secs_left <= self.cfg.path_secs
-            )
-            # Read both books at most once per tick, shared by arb / status / path.
-            up_top = down_top = None
-            if self.status.enabled or self.cfg.arb_enabled or sampling:
-                up_top = self.reader.top(market.up_token)
-                down_top = self.reader.top(market.down_token)
+                secs_left = market.seconds_left
+                sampling = (
+                    self.cfg.record and self.cfg.path_secs > 0 and secs_left <= self.cfg.path_secs
+                )
+                # Read both books at most once per tick, shared by arb / maker /
+                # status / path.
+                up_top = down_top = None
+                if self.status.enabled or self.cfg.arb_enabled or sampling or maker is not None:
+                    up_top = self.reader.top(market.up_token)
+                    down_top = self.reader.top(market.down_token)
 
-            if sampling:
-                tick = self.feed.latest
-                path.append({
-                    "t": round(secs_left, 1),
-                    "btc": round(tick.price, 2) if tick else None,
-                    "up": up_top.best_ask if up_top else None,
-                    "dn": down_top.best_ask if down_top else None,
-                })
+                if sampling:
+                    tick = self.feed.latest
+                    path.append({
+                        "t": round(secs_left, 1),
+                        "btc": round(tick.price, 2) if tick else None,
+                        "up": up_top.best_ask if up_top else None,
+                        "dn": down_top.best_ask if down_top else None,
+                    })
 
-            if trades < self.cfg.max_trades_per_window:
-                # Momentum only when we actually saw the open; arb is always safe.
-                signal = self._pick_signal(market, witnessed, up_top, down_top)
-                if signal is not None:
-                    fills = self._execute(signal, market)
+                if maker is not None:
+                    fills = maker.step(up_top, down_top)
                     for f in fills:
                         position.add(f)
                     if fills:
-                        trades += 1
-                        self._window_logged.clear()  # let any further trade log fresh
-                        self._record_fills(market, signal, fills, open_price)
+                        self._record_fills(
+                            market, Signal("maker", [], f"rest bid {self.cfg.maker_bid:.2f}"),
+                            fills, open_price,
+                        )
+                    pair = maker.complete_pair_signal(up_top, down_top)
+                    hedge = None
+                    if pair is None and witnessed and open_price is not None:
+                        proj = self.feed.projected_close(market.window_end, self.cfg.twap_secs)
+                        hedge = maker.hedge_signal(proj, open_price, up_top, down_top)
+                    follow = pair or hedge
+                    if follow is not None:
+                        fills = self._execute(follow, market)
+                        if fills:
+                            for f in fills:
+                                position.add(f)
+                            maker.mark_hedged(fills)
+                            self._record_fills(market, follow, fills, open_price)
 
-            self._render_status(market, open_price, up_top, down_top, position)
-            await asyncio.sleep(self.cfg.poll_interval_secs)
+                if trades < self.cfg.max_trades_per_window:
+                    # Momentum only when we actually saw the open; arb is always safe.
+                    signal = self._pick_signal(market, witnessed, up_top, down_top)
+                    if signal is not None:
+                        fills = self._execute(signal, market)
+                        for f in fills:
+                            position.add(f)
+                        if fills:
+                            trades += 1
+                            self._window_logged.clear()  # let any further trade log fresh
+                            self._record_fills(market, signal, fills, open_price)
+
+                self._render_status(market, open_price, up_top, down_top, position)
+                await asyncio.sleep(self.cfg.poll_interval_secs)
+        finally:
+            if maker is not None:
+                maker.close()  # never leave a bid resting into the next window
 
         self._settle_window(market, position, open_price, witnessed, path)
 
@@ -370,7 +409,11 @@ class Bot:
         self, market: Market, position: Position, open_price: float | None,
         witnessed: bool, path: list[dict] | None = None,
     ) -> None:
-        close_price = self.feed.latest.price if self.feed.latest else None
+        # The market settles on the Chainlink TWAP over the final `twap_secs`,
+        # not the last tick.
+        close_price = self.feed.twap(market.window_end - self.cfg.twap_secs, market.window_end)
+        if close_price is None and self.feed.latest:
+            close_price = self.feed.latest.price
         # Outcome is only trustworthy when we witnessed the true open.
         up_won = (
             (close_price >= open_price)
@@ -400,7 +443,7 @@ class Bot:
             self._credit_bankroll(position.cost + window_pnl)
             prefix = "if you entered, " if self.cfg.mode == "signal" else ""
             log.info(
-                "SETTLE %s won | open=%.1f close=%.1f | %swindow PnL=%+.2f | session=%+.2f | bankroll=%s",
+                "SETTLE %s won | open=%.1f closeTWAP=%.1f | %swindow PnL=%+.2f | session=%+.2f | bankroll=%s",
                 "UP" if up_won else "DOWN", open_price, close_price, prefix,
                 window_pnl, self.session_pnl,
                 f"${self.executor.bankroll:.2f}" if self.executor.bankroll is not None else "∞",
@@ -427,6 +470,7 @@ class Bot:
                 shares=f.size,
                 cost=f.cost,
                 order_id=f.order_id,
+                maker=f.maker,
                 btc_price=btc,
                 open_price=open_price,
                 delta=round(delta, 2) if delta is not None else None,

@@ -49,8 +49,15 @@ window (`_trade_window`) wires the pieces together:
   uses the feed.
 - **Execution** (`clob.py` → `live.py`) — `Executor.buy` simulates in paper mode or
   delegates to `LiveTrader` in live mode.
-- **Settlement** — at window close, paper positions settle against the final feed
-  price; live positions settle on-chain.
+- **Settlement** — the market resolves on the **Chainlink 60s TWAP** at close vs.
+ the open snapshot (rules changed Aug 2026), so paper positions settle against
+ `feed.twap(end-60, end)`, and momentum decides on `feed.projected_close(...)`
+ plus its `flip_needed` margin — not on the last tick. Live positions settle
+ on-chain.
+- **Maker pair** (`maker.py`, `PM_MAKER`) — rests post-only GTC bids on both
+ sides early in the window; paper fills are simulated when the best ask crosses
+ our bid. `MakerPair.close()` must always run at window end (it's in a
+ `finally`) so no bid is left resting into the next market.
 - **Paper bankroll** — paper mode tracks a simulated balance (`PM_PAPER_BANKROLL`)
   on the `Executor`: debited on each fill, credited the payout on settlement. The
   run loop stops when it can't fund the next trade (`_bankroll_exhausted`).

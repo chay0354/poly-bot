@@ -50,11 +50,21 @@ Main loop (`pm5/bot.py`), once per 5-minute window:
 3. Each second:
    - **Arbitrage** — if `ask(Up) + ask(Down) ≤ 1 − edge`, buy both sides for a
      risk-free payout. Preferred whenever available.
+   - **Maker pair** (`PM_MAKER=true`) — shortly after the open, rest post-only
+     bids on *both* Up and Down below the mid (e.g. 0.46 + 0.46). Makers pay no
+     fee. If both get hit the \$1 payout is locked at a discount; if only one
+     is hit we hold a cheap directional leg and, in the closing seconds, hedge
+     it with the other side if the TWAP projection says it is losing. Unfilled
+     bids are cancelled at `PM_MAKER_CANCEL_LEFT`. This is the "trade in every
+     window" strategy.
    - **Momentum** — only in the closing seconds, and only if we witnessed the
-     open: if the live Chainlink price has moved far enough from the open (and
-     short-term momentum agrees), buy the side that is currently winning while
-     it is still cheaper than its \$1.00 fair value.
-4. At window close, **settle** (paper mode) against the final price and log PnL.
+     open. The market settles on the **Chainlink 60s TWAP** at close vs. the
+     open snapshot, so the bot projects where that TWAP lands and how far BTC
+     would have to *average* away from here for the rest of the window to flip
+     the result (`PM_MIN_FLIP_USD`). Only then does it buy the winning side.
+4. At window close, **settle** (paper mode) against the 60s TWAP and log PnL.
+   Paper taker fills are charged Polymarket's crypto taker fee
+   (`7% × p × (1−p)` per share) so paper results aren't flattering.
 
 ### Why the Chainlink feed (not Binance)
 
@@ -178,11 +188,24 @@ This is a **long-running worker**, not a website. Do **not** deploy to Vercel.
    | `PM_SIGNATURE_TYPE` | `3` for current Polymarket email/deposit wallets |
    | `PM_FUNDER_ADDRESS` | your Polymarket profile / API address |
    | `PM_STAKE_USDC` | `5` |
+   | `PM_MAKER` | `true` |
+   | `PM_MAKER_BID` | `0.46` |
+   | `PM_MAKER_STAKE_USDC` | `5` |
+   | `PM_MAKER_PAIR_GRACE` | `5` |
+   | `PM_MAKER_PAIR_MAX_SUM` | `1.04` |
+   | `PM_MAKER_PAIR_HARD` | `20` |
+   | `PM_MAKER_PAIR_HARD_SUM` | `1.12` |
+   | `PM_MAKER_HEDGE_MAX` | `0.60` |
+   | `PM_MOMENTUM` | `true` |
    | `PM_MIN_PRICE` | `0.50` |
    | `PM_MAX_PRICE` | `0.85` |
    | `PM_MIN_DELTA_USD` | `25` |
    | `PM_ARB` | `false` |
    | `PM_LIVE_STATUS` | `false` |
+   | `SUPABASE_URL` | project URL (optional; bot writes settled P&L) |
+   | `SUPABASE_SECRET_KEY` | `sb_secret_…` (Railway secret, not git) |
+
+   Run **only one** live worker. Stop any local `run.py` first or you will double-trade.
 
 5. Use an **always-on** worker (no sleep). There is no HTTP port to bind.
 6. After deploy, logs should show `starting in LIVE mode` and `price feed connected`.
@@ -207,7 +230,22 @@ If Railway offers a "web" vs **worker** process, pick worker / empty start comma
 | `PM_MOMENTUM` | `true` | Enable the momentum strategy |
 | `PM_DECIDE_WITHIN` | `45` | Only enter momentum within N s of close |
 | `PM_STOP_ENTRY` | `3` | Stop entering N s before close |
-| `PM_MIN_DELTA_USD` | `25` | Min |price − open| (USD) for momentum |
+| `PM_MIN_DELTA_USD` | `25` | Min |projected TWAP − open| (USD) for momentum |
+| `PM_TWAP_SECS` | `60` | Settlement TWAP window (per the market rules) |
+| `PM_MIN_FLIP_USD` | `20` | BTC must need to average ≥ this far away to flip the result |
+| `PM_MAKER` | `false` | Enable the maker-pair strategy (a trade every window) |
+| `PM_MAKER_BID` | `0.46` | Resting bid price on each side (pair costs 2× this) |
+| `PM_MAKER_STAKE_USDC` | `5` | USDC per side for the resting bids |
+| `PM_MAKER_START` | `10` | Post bids this many seconds after the open |
+| `PM_MAKER_CANCEL_LEFT` | `75` | Cancel unfilled bids with this many seconds left |
+| `PM_MAKER_HEDGE_MAX` | `0.60` | Hedge a losing lone leg up to this ask (0 = never) |
+| `PM_MAKER_PAIR_GRACE` | `5` | Seconds naked before allowing pair sum ≤ MAX_SUM |
+| `PM_MAKER_PAIR_MAX_SUM` | `1.04` | Close the pair up to this fill+ask after grace |
+| `PM_MAKER_PAIR_HARD` | `20` | Seconds naked before allowing pair sum ≤ HARD_SUM |
+| `PM_MAKER_PAIR_HARD_SUM` | `1.12` | Last-resort pair close (bounded loss) |
+| `SUPABASE_URL` | — | Optional P&L logging |
+| `SUPABASE_SECRET_KEY` | — | Secret key; backend only |
+| `PM_TAKER_FEE_RATE` | `0.07` | Crypto taker fee rate used for paper fills |
 | `PM_ARB` | `true` | Enable the arbitrage strategy |
 | `PM_ARB_MIN_EDGE` | `0.02` | Required `1 − (ask_up+ask_down)` edge |
 | `PM_ARB_STAKE_USDC` | `5` | USDC per side for arbitrage |

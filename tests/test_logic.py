@@ -66,6 +66,12 @@ class _FeedStub(ChainlinkFeed):
     def momentum(self, lookback_secs):
         return self._mom
 
+    def projected_close(self, window_end, lookback, now=None):
+        # Nothing locked in yet: projection == last price, flip == |Δ|.
+        from pm5.pricefeed import TwapProjection
+        p = self.latest.price
+        return TwapProjection(p, 0.0, lookback, p, p)
+
 
 def test_momentum_fires_up_when_price_above_open():
     cfg = Config()
@@ -359,7 +365,8 @@ def test_settlement_records_window(tmp_path):
     bot.recorder = Recorder(str(tmp_path / "trades.jsonl"), enabled=True, mode="paper")
 
     # Feed stub exposing the closing price.
-    bot.feed = type("F", (), {"latest": Tick(price=63435.8, src_ts=0, recv_ts=0)})()
+    bot.feed = type("F", (), {"latest": Tick(price=63435.8, src_ts=0, recv_ts=0),
+                              "twap": lambda self, a, b: None})()
 
     market = make_market()
     market.window_start = 1781270100
@@ -471,13 +478,15 @@ def test_bankroll_credited_on_settlement():
     cfg = Config()
     cfg.mode = "paper"
     cfg.paper_bankroll = 100.0
+    cfg.taker_fee_rate = 0.0  # pure bankroll arithmetic; fee tested separately
     bot = Bot.__new__(Bot)
     bot.cfg = cfg
     bot.session_pnl = 0.0
     bot.day_pnl = 0.0
     bot.recorder = type("R", (), {"enabled": False})()
     bot.executor = Executor(cfg, reader=None)
-    bot.feed = type("F", (), {"latest": Tick(price=101.0, src_ts=0, recv_ts=0)})()
+    bot.feed = type("F", (), {"latest": Tick(price=101.0, src_ts=0, recv_ts=0),
+                              "twap": lambda self, a, b: None})()
 
     # Simulate a bought position: bankroll debited at fill time.
     fill = bot.executor.buy("UP", "up", 5.0, 0.85, top=_book(0.50))  # 10 sh @ 0.50, cost 5

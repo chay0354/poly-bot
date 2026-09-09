@@ -40,6 +40,68 @@ class Tick:
     recv_ts: float  # seconds, local receive time
 
 
+@dataclass
+class TwapProjection:
+    """Where the settlement TWAP lands if the price holds from now to close."""
+
+    twap: float
+    known_secs: float      # part of the TWAP window already locked in
+    remaining_secs: float  # part still to come
+    known_mean: float      # TWAP of the locked-in part
+    last: float            # latest price
+
+    def flip_needed(self, open_price: float) -> float:
+        """USD move (from the latest price) BTC must *average* over the
+        remaining seconds to flip the outcome. Positive = the current side is
+        safe by that much; grows quickly as the window locks in.
+
+        Returns +inf when nothing remains (outcome fixed) and the projection is
+        on one side, 0 when projection == open.
+        """
+        delta = self.twap - open_price
+        if delta == 0:
+            return 0.0
+        if self.remaining_secs <= 0:
+            return float("inf")
+        # Final TWAP flips when the remaining-period mean m_r satisfies
+        # (known*known_mean + remaining*m_r)/L == open  =>
+        # m_r = (L*open - known*known_mean)/remaining.
+        total = self.known_secs + self.remaining_secs
+        m_r = (total * open_price - self.known_secs * self.known_mean) / self.remaining_secs
+        return abs(self.last - m_r)
+
+    @property
+    def locked_frac(self) -> float:
+        total = self.known_secs + self.remaining_secs
+        return self.known_secs / total if total else 0.0
+
+
+def _twap(history: list[Tick], start_ts: float, end_ts: float) -> float | None:
+    """Step-function time-weighted mean of `history` over [start_ts, end_ts]."""
+    area = 0.0
+    covered = 0.0
+    prev: Tick | None = None
+    for t in history:
+        if prev is not None and prev.src_ts < end_ts and t.src_ts > start_ts:
+            a = max(prev.src_ts, start_ts)
+            b = min(t.src_ts, end_ts)
+            if b > a:
+                area += prev.price * (b - a)
+                covered += b - a
+        prev = t
+    # The last tick holds until end_ts.
+    if prev is not None and prev.src_ts < end_ts:
+        a = max(prev.src_ts, start_ts)
+        if end_ts > a:
+            area += prev.price * (end_ts - a)
+            covered += end_ts - a
+    if covered <= 0:
+        # Range lies before every tick we have: use the first tick as the
+        # best available estimate.
+        return history[0].price if history else None
+    return area / covered
+
+
 class ChainlinkFeed:
     """Maintains the latest BTC/USD tick and a short rolling history."""
 
@@ -131,6 +193,40 @@ class ChainlinkFeed:
             if t.src_ts >= ts:
                 return t.price
         return None
+
+    def twap(self, start_ts: float, end_ts: float) -> float | None:
+        """Time-weighted average price over [start_ts, end_ts] (source time).
+
+        Ticks are treated as a step function (each price holds until the next
+        tick), which is how the Chainlink TWAP stream the market resolves on
+        behaves. Returns None if no tick covers the range.
+        """
+        if end_ts <= start_ts or not self._history:
+            return None
+        return _twap(self._history, start_ts, end_ts)
+
+    def projected_close(self, window_end: float, lookback: float,
+                        now: float | None = None) -> "TwapProjection | None":
+        """Project the settlement TWAP assuming the price holds from now on.
+
+        The market resolves on the TWAP over the final `lookback` seconds. Part
+        of that window has already elapsed and is locked in; the rest is
+        unknown and is filled with the latest price.
+        """
+        if not self.latest or not self._history:
+            return None
+        now = self.latest.src_ts if now is None else now
+        start = window_end - lookback
+        known = min(max(now - start, 0.0), lookback)
+        remaining = lookback - known
+        if known <= 0:
+            known_mean = self.latest.price
+        else:
+            known_mean = _twap(self._history, start, now)
+            if known_mean is None:
+                known_mean = self.latest.price
+        proj = (known * known_mean + remaining * self.latest.price) / lookback
+        return TwapProjection(proj, known, remaining, known_mean, self.latest.price)
 
     def momentum(self, lookback_secs: float) -> float | None:
         """Signed price change over the last `lookback_secs` of history."""

@@ -25,10 +25,34 @@ class Fill:
     token_id: str
     side: str  # "up" / "down" (for logging)
     price: float  # avg fill price (paper) or limit price (live)
-    size: float  # shares
+    size: float  # shares (net of any taker fee, which Polymarket charges in shares)
     cost: float  # USDC spent
     paper: bool
     order_id: str | None = None
+    maker: bool = False  # resting bid that got hit (0% fee) vs. a taker buy
+
+
+@dataclass
+class RestingOrder:
+    """A post-only GTC bid resting on the book (real or simulated)."""
+
+    token_id: str
+    side: str
+    price: float
+    size: float  # shares requested
+    filled: float = 0.0  # shares matched so far
+    order_id: str | None = None
+    paper: bool = True
+    done: bool = False  # cancelled or fully filled
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, round(self.size - self.filled, 2))
+
+
+def taker_fee_usdc(shares: float, price: float, rate: float) -> float:
+    """Polymarket taker fee: shares × rate × p × (1-p). Peaks at p=0.5."""
+    return shares * rate * price * (1.0 - price)
 
 
 class BookReader:
@@ -111,11 +135,68 @@ class Executor:
         shares = round(stake_usdc / price, 2)
         if self._live is None:
             cost = round(shares * price, 4)
+            # Taker fee is charged in shares on buys: we pay `cost`, receive fewer.
+            fee = taker_fee_usdc(shares, price, self.cfg.taker_fee_rate)
+            net_shares = round(shares - fee / price, 2)
             if self.bankroll is not None:
                 self.bankroll -= cost
-            log.info("[PAPER] BUY %s %.2f sh @ %.3f = $%.2f | bankroll $%s",
-                     side, shares, price, cost,
+            log.info("[PAPER] BUY %s %.2f sh @ %.3f = $%.2f (fee $%.3f) | bankroll $%s",
+                     side, net_shares, price, cost, fee,
                      f"{self.bankroll:.2f}" if self.bankroll is not None else "∞")
-            return Fill(token_id, side, price, shares, cost, paper=True)
+            return Fill(token_id, side, price, net_shares, cost, paper=True)
 
         return self._live.buy(token_id, side, price, shares)
+
+    # ------------------------------------------------------------------ maker
+
+    def place_bid(
+        self, token_id: str, side: str, price: float, shares: float,
+        tick_size: float, neg_risk: bool,
+    ) -> RestingOrder | None:
+        """Rest a post-only GTC bid. Paper mode just records it; the bankroll
+        is debited when (and as much as) it fills."""
+        if self._live is None:
+            log.info("[PAPER] REST bid %s %.2f sh @ %.2f", side, shares, price)
+            return RestingOrder(token_id, side, price, shares, paper=True)
+        return self._live.place_bid(token_id, side, price, shares, tick_size, neg_risk)
+
+    def poll_bid(self, order: RestingOrder, top: BookTop | None = None) -> Fill | None:
+        """Check a resting bid for new fills; returns a Fill for the new shares.
+
+        Paper: we can't see the tape, so a bid counts as hit only when the best
+        ask has come down to (or through) our price -- a conservative proxy.
+        """
+        if order.done:
+            return None
+        if order.paper:
+            if top is None:
+                top = self.reader.top(order.token_id)
+            if top.best_ask is None or top.best_ask > order.price:
+                return None
+            avail = top.best_ask_size if top.best_ask_size > 0 else order.remaining
+            qty = round(min(order.remaining, avail), 2)
+            if qty <= 0:
+                return None
+            cost = round(qty * order.price, 4)
+            if self.bankroll is not None:
+                if self.bankroll < cost:
+                    return None
+                self.bankroll -= cost
+            order.filled = round(order.filled + qty, 2)
+            if order.remaining <= 0:
+                order.done = True
+            log.info("[PAPER] bid HIT %s %.2f sh @ %.2f = $%.2f (maker, no fee)",
+                     order.side, qty, order.price, cost)
+            return Fill(order.token_id, order.side, order.price, qty, cost,
+                        paper=True, maker=True)
+        return self._live.poll_bid(order)
+
+    def cancel_bid(self, order: RestingOrder) -> None:
+        if order.done:
+            return
+        order.done = True
+        if order.paper:
+            log.info("[PAPER] cancel bid %s (%.2f/%.2f filled)",
+                     order.side, order.filled, order.size)
+            return
+        self._live.cancel_bid(order)

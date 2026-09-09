@@ -36,12 +36,14 @@ class Leg:
 
 
 class MomentumStrategy:
-    """In the closing seconds, back the side the Chainlink price already favors.
+    """In the closing seconds, back the side the settlement TWAP already favors.
 
-    Resolution compares the window's closing price to its opening price. If, with
-    little time left, the live price is comfortably above (below) the open, "Up"
-    ("Down") is the likely winner -- buy it while it is still cheaper than its
-    fair value of ~1.0.
+    The market resolves Up if the Chainlink TWAP over the final `twap_secs` of
+    the window is >= the opening price. Once we are inside that TWAP window,
+    part of the average is locked in, so we can compute (a) where the TWAP
+    lands if the price holds, and (b) how far BTC would have to *average* away
+    from here for the rest of the window to flip the result. Both must clear
+    their thresholds before we buy.
     """
 
     def __init__(self, cfg: Config, feed: ChainlinkFeed) -> None:
@@ -60,8 +62,14 @@ class MomentumStrategy:
         open_price = self.feed.price_at_or_after(market.window_start)
         if open_price is None:
             return None
-        delta = tick.price - open_price
+        proj = self.feed.projected_close(market.window_end, self.cfg.twap_secs)
+        if proj is None:
+            return None
+        delta = proj.twap - open_price
         if abs(delta) < self.cfg.min_delta_usd:
+            return None
+        flip = proj.flip_needed(open_price)
+        if flip < self.cfg.min_flip_usd:
             return None
         # Require short-term momentum to agree with the window delta (no fade
         # right before close).
@@ -80,7 +88,8 @@ class MomentumStrategy:
             kind="momentum",
             legs=[leg],
             reason=(
-                f"Δopen={delta:+.1f} USD, {left:.0f}s left, "
+                f"TWAP Δopen={delta:+.1f} USD ({proj.locked_frac:.0%} locked, "
+                f"flip needs {flip:.0f} USD avg), {left:.0f}s left, "
                 f"price={tick.price:.1f}, open={open_price:.1f}"
             ),
         )

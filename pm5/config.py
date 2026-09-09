@@ -72,8 +72,51 @@ class Config:
     decide_within_secs: float = field(default_factory=lambda: _f("PM_DECIDE_WITHIN", 45.0))
     # Hard cutoff: stop entering this many seconds before close.
     stop_entry_secs: float = field(default_factory=lambda: _f("PM_STOP_ENTRY", 3.0))
-    # Minimum |price - open| (in USD) before momentum will fire.
+    # Minimum |projected settlement TWAP - open| (in USD) before momentum fires.
     min_delta_usd: float = field(default_factory=lambda: _f("PM_MIN_DELTA_USD", 25.0))
+    # The market settles on the Chainlink TWAP over the final N seconds of the
+    # window (not the last tick). Part of that window is already locked in when
+    # we decide; the rest is unknown.
+    twap_secs: float = field(default_factory=lambda: _f("PM_TWAP_SECS", 60.0))
+    # Momentum also requires that BTC would have to *average* at least this many
+    # USD away from its current price over the remaining seconds to flip the
+    # outcome. Grows fast as the TWAP window locks in, so this is what makes a
+    # late entry safe rather than a guess.
+    min_flip_usd: float = field(default_factory=lambda: _f("PM_MIN_FLIP_USD", 20.0))
+
+    # --- Maker-pair strategy (a trade in every window) ---
+    # Rest post-only bids on BOTH Up and Down early in the window, priced so
+    # that the pair sums below $1. Makers pay 0% fee (takers pay 7% × p(1-p))
+    # and earn rebates. If both bids fill the $1 payout is locked in at a
+    # profit; if only one fills we hold a cheap directional position and may
+    # hedge it in the closing seconds if the TWAP projection turns against us.
+    maker_enabled: bool = field(default_factory=lambda: _b("PM_MAKER", False))
+    maker_bid: float = field(default_factory=lambda: _f("PM_MAKER_BID", 0.46))
+    maker_stake_usdc: float = field(default_factory=lambda: _f("PM_MAKER_STAKE_USDC", 5.0))
+    # Post the bids this many seconds after the window opens (let the book form).
+    maker_start_secs: float = field(default_factory=lambda: _f("PM_MAKER_START", 10.0))
+    # Cancel whatever is still unfilled when this many seconds are left.
+    maker_cancel_left_secs: float = field(default_factory=lambda: _f("PM_MAKER_CANCEL_LEFT", 75.0))
+    # If exactly one side filled and the TWAP projection says it is losing,
+    # buy the other side (taker) up to this ask to cap the loss. 0 = never hedge.
+    maker_hedge_max_price: float = field(default_factory=lambda: _f("PM_MAKER_HEDGE_MAX", 0.60))
+    # Never sit on a naked leg: once one bid fills, take the other side as a
+    # taker the moment avg_fill + ask <= 1.00 (profit locked). If that never
+    # comes, after PM_MAKER_PAIR_GRACE seconds naked accept a small *known*
+    # loss instead of a coin flip: take it while avg_fill + ask <= PAIR_MAX_SUM
+    # (1.04 = lose at most 4c per share pair).
+    maker_pair_grace_secs: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_GRACE", 5.0))
+    maker_pair_max_sum: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_MAX_SUM", 1.04))
+    # Still naked after PM_MAKER_PAIR_HARD seconds: pay up to HARD_SUM to close
+    # the pair (1.12 = at most 12c/share). Holding on is the same expected
+    # loss with a $stake coin flip attached, so we take the bounded one.
+    maker_pair_hard_secs: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_HARD", 20.0))
+    maker_pair_hard_sum: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_HARD_SUM", 1.12))
+
+    # --- Fees ---
+    # Polymarket crypto taker fee: shares × rate × p × (1-p). Makers pay 0.
+    # Applied to paper fills so paper P&L is honest.
+    taker_fee_rate: float = field(default_factory=lambda: _f("PM_TAKER_FEE_RATE", 0.07))
 
     # --- Arbitrage strategy ---
     arb_enabled: bool = field(default_factory=lambda: _b("PM_ARB", False))
