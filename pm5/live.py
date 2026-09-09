@@ -74,6 +74,44 @@ class LiveTrader:
         log.info("[LIVE] BUY %s %.2f sh @ %.3f = $%.2f (id=%s)", side, shares, price, cost, order_id)
         return Fill(token_id, side, price, shares, cost, paper=False, order_id=order_id)
 
+    def sell(self, token_id: str, side: str, price: float, shares: float) -> Fill | None:
+        """Fill-or-Kill marketable sell. `price` is the protective bid floor.
+        `amount` is shares (CLOB convention), not USDC.
+        """
+        amount = round(shares, 2)
+        if amount <= 0:
+            return None
+        args = MarketOrderArgs(
+            token_id=token_id,
+            amount=amount,
+            side=Side.SELL,
+            price=price,
+            order_type=OrderType.FOK,
+        )
+        try:
+            resp = self.client.create_and_post_market_order(
+                order_args=args,
+                order_type=OrderType.FOK,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.error("[LIVE] sell failed for %s: %s", side, e)
+            return None
+
+        if not isinstance(resp, dict):
+            log.error("[LIVE] unexpected sell response for %s: %s", side, resp)
+            return None
+        order_id = resp.get("orderID") or resp.get("orderId")
+        success = resp.get("success", True if order_id else False)
+        if not success:
+            log.error("[LIVE] sell rejected for %s: %s", side, resp)
+            return None
+        proceeds = round(amount * price, 4)
+        log.info(
+            "[LIVE] SELL %s %.2f sh @ %.3f = $%.2f (id=%s)",
+            side, amount, price, proceeds, order_id,
+        )
+        return Fill(token_id, side, price, -amount, -proceeds, paper=False, order_id=order_id)
+
     # ------------------------------------------------------------------ maker
 
     def place_bid(

@@ -55,9 +55,12 @@ window (`_trade_window`) wires the pieces together:
  plus its `flip_needed` margin — not on the last tick. Live positions settle
  on-chain.
 - **Maker pair** (`maker.py`, `PM_MAKER`) — rests post-only GTC bids on both
- sides early in the window; paper fills are simulated when the best ask crosses
- our bid. `MakerPair.close()` must always run at window end (it's in a
- `finally`) so no bid is left resting into the next market.
+  sides early in the window; paper fills are simulated when the best ask crosses
+  our bid. A Chainlink move of `PM_MAKER_DEFENSIVE_USD` vs the witnessed open
+  cancels the unfilled bid on the side about to be dumped. If a naked leg
+  cannot pair after `PM_MAKER_EXIT_SECS`, we sell it at the bid instead of
+  holding to resolution. `MakerPair.close()` must always run at window end
+  (it's in a `finally`) so no bid is left resting into the next market.
 - **Paper bankroll** — paper mode tracks a simulated balance (`PM_PAPER_BANKROLL`)
   on the `Executor`: debited on each fill, credited the payout on settlement. The
   run loop stops when it can't fund the next trade (`_bankroll_exhausted`).

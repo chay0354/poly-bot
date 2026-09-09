@@ -10,7 +10,11 @@ Makers pay no fee and earn rebates, so:
   usual T-75 cutoff). If the other ask is cheap enough that
   fill_price + ask <= 1, take it immediately and lock the pair. After a short
   grace period still naked, take it while the sum <= maker_pair_max_sum (a
-  small known loss instead of a coin flip). TWAP hedge is the last fallback.
+  small known loss instead of a coin flip). If the other side never comes
+  back, sell the filled leg rather than hold a coin flip. TWAP hedge is the
+  last fallback.
+* BTC dumps vs the open while a bid is still resting -> cancel the side being
+  dumped into before it fills (defensive cancel).
 * nothing hits   -> cancel at `maker_cancel_left_secs`, nothing spent.
 
 Fills for the single-leg case come from adverse flow (someone dumping that
@@ -42,8 +46,10 @@ class MakerPair:
         self.posted = False
         self.cancelled = False
         self.hedged = False
+        self.exited = False
         self._warned_onesided = False
         self._naked_since: float | None = None  # monotonic time we became one-sided
+        self._blocked: set[str] = set()  # sides we will not re-post (defensive pull)
         self._clock = time.monotonic
 
     # ----------------------------------------------------------------- state
@@ -79,13 +85,24 @@ class MakerPair:
 
     # ------------------------------------------------------------------ loop
 
-    def step(self, up_top: BookTop | None, down_top: BookTop | None) -> list[Fill]:
+    def step(
+        self,
+        up_top: BookTop | None,
+        down_top: BookTop | None,
+        btc: float | None = None,
+        open_price: float | None = None,
+    ) -> list[Fill]:
         """Post / poll / cancel resting bids. Returns any new fills."""
         m = self.market
         left = m.seconds_left
         tops = {"up": up_top, "down": down_top}
 
-        if m.seconds_in >= self.cfg.maker_start_secs and left > self._keep_bid_left:
+        if (
+            not self.hedged
+            and not self.exited
+            and m.seconds_in >= self.cfg.maker_start_secs
+            and left > self._keep_bid_left
+        ):
             already_in = bool(self.orders or self.fills)
             if already_in and not self.posted:
                 # One leg is on / filled: always retry the missing bid, even
@@ -113,8 +130,9 @@ class MakerPair:
         elif self._naked_since is None:
             self._naked_since = self._clock()
 
-        if self.hedged:
-            self._pull_overfill_bids("already hedged")
+        if self.hedged or self.exited:
+            self._pull_overfill_bids("already hedged" if self.hedged else "already exited")
+        self._maybe_defensive_cancel(btc, open_price)
         self._maybe_cancel(left)
         return new
 
@@ -139,7 +157,7 @@ class MakerPair:
         A first fill is usually the side being dumped, so waiting only lets the
         other side get dearer; a bounded loss beats a $stake coin flip.
         """
-        if self.hedged:
+        if self.hedged or self.exited:
             return None
         side = self.naked_side
         if side is None:
@@ -181,7 +199,7 @@ class MakerPair:
         up_top: BookTop | None, down_top: BookTop | None,
     ) -> Signal | None:
         """If our lone leg is projected to lose safely, buy the other side."""
-        if self.hedged or self.cfg.maker_hedge_max_price <= 0:
+        if self.hedged or self.exited or self.cfg.maker_hedge_max_price <= 0:
             return None
         side = self.naked_side
         if side is None or proj is None or open_price is None:
@@ -216,6 +234,44 @@ class MakerPair:
             ),
         )
 
+    def exit_signal(
+        self, up_top: BookTop | None, down_top: BookTop | None,
+    ) -> Signal | None:
+        """Sell a stuck naked leg at the bid after the hard pair window.
+
+        Caller must try complete_pair first. We only fire when the other ask
+        never came back inside the hard cap — holding to resolution is then a
+        $stake coin flip; a bid sale is a known (usually smaller) loss.
+        """
+        if self.hedged or self.exited or self.cfg.maker_exit_secs <= 0:
+            return None
+        side = self.naked_side
+        if side is None or self._naked_since is None:
+            return None
+        age = self._clock() - self._naked_since
+        if age < self.cfg.maker_exit_secs:
+            return None
+        top = up_top if side == "up" else down_top
+        if top is None or top.best_bid is None:
+            return None
+        if top.best_bid < self.cfg.maker_exit_min_bid:
+            return None
+        qty = self.naked_shares
+        return Signal(
+            kind="maker-exit",
+            legs=[Leg(
+                side=side,
+                token_id=self.market.token_for(side),
+                max_price=top.best_bid,
+                stake_usdc=round(qty * top.best_bid, 2),
+                top=top,
+            )],
+            reason=(
+                f"exit naked {side} {qty:.1f}sh @ bid {top.best_bid:.2f} "
+                f"after {age:.0f}s (pair never closed)"
+            ),
+        )
+
     def mark_hedged(self, fills: list[Fill]) -> None:
         self.hedged = True
         self.fills.extend(fills)
@@ -224,6 +280,41 @@ class MakerPair:
         # would now over-fill us (a second, naked leg), so pull them at once.
         # `_pull_overfill_bids` also runs every step so a failed cancel retries.
         self._pull_overfill_bids("pair locked by taker buy")
+
+    def mark_exited(self, fills: list[Fill]) -> None:
+        self.exited = True
+        self.hedged = True
+        self.fills.extend(fills)
+        log.info("maker exited: %s", self.summary())
+        self._pull_overfill_bids("sold naked leg")
+
+    def _maybe_defensive_cancel(
+        self, btc: float | None, open_price: float | None,
+    ) -> None:
+        """Pull the unfilled bid on the side a BTC move is about to dump.
+
+        BTC up vs the witnessed open → Down is the dumped token. BTC down → Up.
+        Already-filled sides are left alone so the leftover bid can still pair.
+        """
+        if self.hedged or self.exited or self.cfg.maker_defensive_usd <= 0:
+            return
+        if btc is None or open_price is None:
+            return
+        delta = btc - open_price
+        if abs(delta) < self.cfg.maker_defensive_usd:
+            return
+        toxic = "down" if delta > 0 else "up"
+        if self.shares(toxic) > 0.01:
+            return
+        order = self.orders.get(toxic)
+        if order is None or order.done:
+            return
+        log.info(
+            "maker: defensive cancel %s bid (BTC Δopen=%+.1f ≥ %.0f)",
+            toxic, delta, self.cfg.maker_defensive_usd,
+        )
+        self.executor.cancel_bid(order)
+        self._blocked.add(toxic)
 
     def _pull_overfill_bids(self, why: str) -> None:
         """Cancel live bids that can only add a naked leg.
@@ -235,7 +326,7 @@ class MakerPair:
         for side, order in list(self.orders.items()):
             if order.done:
                 continue
-            if self.hedged or self.shares(side) >= wanted - 0.01:
+            if self.hedged or self.exited or self.shares(side) >= wanted - 0.01:
                 log.info("maker: pulling %s bid (%s)", side, why)
                 self.executor.cancel_bid(order)
 
@@ -262,7 +353,7 @@ class MakerPair:
         return True
 
     def _avg_price(self, side: str) -> float | None:
-        sf = [f for f in self.fills if f.side == side]
+        sf = [f for f in self.fills if f.side == side and f.size > 0]
         sz = sum(f.size for f in sf)
         if sz <= 0:
             return None
@@ -287,6 +378,8 @@ class MakerPair:
         px = self.cfg.maker_bid
         shares = self._wanted_shares()
         for side in ("up", "down"):
+            if side in self._blocked:
+                continue
             if self.shares(side) >= shares - 0.01:
                 continue
             existing = self.orders.get(side)

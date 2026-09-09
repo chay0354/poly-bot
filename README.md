@@ -53,10 +53,11 @@ Main loop (`pm5/bot.py`), once per 5-minute window:
    - **Maker pair** (`PM_MAKER=true`) — shortly after the open, rest post-only
      bids on *both* Up and Down below the mid (e.g. 0.46 + 0.46). Makers pay no
      fee. If both get hit the \$1 payout is locked at a discount; if only one
-     is hit we hold a cheap directional leg and, in the closing seconds, hedge
-     it with the other side if the TWAP projection says it is losing. Unfilled
-     bids are cancelled at `PM_MAKER_CANCEL_LEFT`. This is the "trade in every
-     window" strategy.
+     is hit we hold a cheap directional leg and try to complete the pair; if
+     the other side never comes back we sell the filled leg rather than hold
+     a coin flip. A sudden Chainlink move vs the open cancels the unfilled
+     bid on the side about to be dumped. Unfilled bids are also cancelled at
+     `PM_MAKER_CANCEL_LEFT`. This is the "trade in every window" strategy.
    - **Momentum** — only in the closing seconds, and only if we witnessed the
      open. The market settles on the **Chainlink 60s TWAP** at close vs. the
      open snapshot, so the bot projects where that TWAP lands and how far BTC
@@ -195,6 +196,9 @@ This is a **long-running worker**, not a website. Do **not** deploy to Vercel.
    | `PM_MAKER_PAIR_MAX_SUM` | `1.04` |
    | `PM_MAKER_PAIR_HARD` | `20` |
    | `PM_MAKER_PAIR_HARD_SUM` | `1.12` |
+   | `PM_MAKER_DEFENSIVE_USD` | `20` |
+   | `PM_MAKER_EXIT_SECS` | `20` |
+   | `PM_MAKER_EXIT_MIN_BID` | `0.10` |
    | `PM_MAKER_HEDGE_MAX` | `0.60` |
    | `PM_MOMENTUM` | `true` |
    | `PM_MIN_PRICE` | `0.50` |
@@ -246,6 +250,9 @@ If Railway offers a "web" vs **worker** process, pick worker / empty start comma
 | `PM_MAKER_PAIR_MAX_SUM` | `1.04` | Close the pair up to this fill+ask after grace |
 | `PM_MAKER_PAIR_HARD` | `20` | Seconds naked before allowing pair sum ≤ HARD_SUM |
 | `PM_MAKER_PAIR_HARD_SUM` | `1.12` | Last-resort pair close (bounded loss) |
+| `PM_MAKER_DEFENSIVE_USD` | `20` | Cancel the unfilled dumped-side bid after this BTC move vs open (0 = off) |
+| `PM_MAKER_EXIT_SECS` | `20` | Seconds naked before selling the filled leg if the pair cannot close (0 = off) |
+| `PM_MAKER_EXIT_MIN_BID` | `0.10` | Don't sell-to-exit into a bid below this |
 | `SUPABASE_URL` | — | Optional P&L logging |
 | `SUPABASE_SECRET_KEY` | — | Secret key; backend only |
 | `PM_TAKER_FEE_RATE` | `0.07` | Crypto taker fee rate used for paper fills |

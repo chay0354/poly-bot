@@ -80,7 +80,7 @@ class BookReader:
 
 
 class Executor:
-    """Places (or simulates) buy orders."""
+    """Places (or simulates) buy and sell orders."""
 
     def __init__(self, cfg: Config, reader: BookReader) -> None:
         self.cfg = cfg
@@ -146,6 +146,53 @@ class Executor:
             return Fill(token_id, side, price, net_shares, cost, paper=True)
 
         return self._live.buy(token_id, side, price, shares)
+
+    def sell(
+        self,
+        token_id: str,
+        side: str,
+        shares: float,
+        min_price: float,
+        top: BookTop | None = None,
+    ) -> Fill | None:
+        """Marketable sell of `shares` at the best bid, if bid >= `min_price`.
+
+        Fill.size is negative and Fill.cost is negative proceeds so Position
+        and paper settlement net the exit correctly.
+        """
+        if shares <= 0:
+            self.last_skip = "nothing to sell"
+            return None
+        if top is None:
+            top = self.reader.top(token_id)
+        if top.best_bid is None:
+            self.last_skip = "no bids on book"
+            return None
+        if top.best_bid < min_price:
+            self.last_skip = f"bid {top.best_bid:.2f} < floor {min_price:.2f}"
+            return None
+        if top.best_bid_size > 0 and top.best_bid_size + 1e-9 < shares:
+            self.last_skip = f"bid size {top.best_bid_size:.2f} < {shares:.2f}"
+            return None
+
+        self.last_skip = None
+        price = top.best_bid
+        qty = round(shares, 2)
+        if self._live is None:
+            proceeds = round(qty * price, 4)
+            fee = taker_fee_usdc(qty, price, self.cfg.taker_fee_rate)
+            net = round(proceeds - fee, 4)
+            cost = -net
+            if self.bankroll is not None:
+                self.bankroll -= cost
+            log.info(
+                "[PAPER] SELL %s %.2f sh @ %.3f = $%.2f (fee $%.3f) | bankroll $%s",
+                side, qty, price, net, fee,
+                f"{self.bankroll:.2f}" if self.bankroll is not None else "∞",
+            )
+            return Fill(token_id, side, price, -qty, cost, paper=True)
+
+        return self._live.sell(token_id, side, price, qty)
 
     # ------------------------------------------------------------------ maker
 

@@ -333,3 +333,87 @@ def test_maker_paper_fill_respects_bankroll():
     mk.step(_book(0.52), _book(0.52))
     assert mk.step(_book(0.46), _book(0.52)) == []
     assert ex.bankroll == 3.0
+
+
+def test_maker_defensive_cancel_pulls_dumped_side():
+    cfg, ex, m, mk = _maker()
+    cfg.maker_defensive_usd = 20
+    mk.step(_book(0.52), _book(0.52))
+    assert not mk.orders["down"].done and not mk.orders["up"].done
+    # +10 is noise: both bids stay.
+    mk.step(_book(0.52), _book(0.52), btc=50010.0, open_price=50000.0)
+    assert not mk.orders["down"].done and not mk.orders["up"].done
+    # BTC dumped up: Down is about to be sold into us — pull only that bid.
+    mk.step(_book(0.52), _book(0.52), btc=50025.0, open_price=50000.0)
+    assert mk.orders["down"].done and not mk.orders["up"].done
+    assert "down" in mk._blocked
+    # Must not re-post the toxic side later in the window.
+    mk.posted = False
+    mk.step(_book(0.52), _book(0.52), btc=50025.0, open_price=50000.0)
+    assert mk.orders["down"].done
+
+
+def test_maker_defensive_keeps_other_bid_after_fill():
+    cfg, ex, m, mk = _maker()
+    cfg.maker_defensive_usd = 20
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.46), _book(0.56))  # Up hit; leftover Down bid is the hedge
+    assert mk.naked_side == "up" and not mk.orders["down"].done
+    mk.step(_book(0.60), _book(0.56), btc=49970.0, open_price=50000.0)
+    # BTC down makes Up the dumped side, but Up already filled — keep Down.
+    assert not mk.orders["down"].done
+
+
+def test_maker_exit_sells_naked_leg_after_hard_window():
+    """The 10:25 case: Down filled, Up ask ran past 1.12, hold was a $5 coin flip."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_pair_hard_secs = 20
+    cfg.maker_pair_hard_sum = 1.12
+    cfg.maker_exit_secs = 20
+    cfg.maker_exit_min_bid = 0.10
+    now = {"t": 1000.0}
+    mk._clock = lambda: now["t"]
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.60), _book(0.46))  # Down hit; Up ask 0.60 -> sum 1.06
+    expensive_up = _book(0.70, bid=0.28)
+    cheap_dn = _book(0.90, bid=0.28)
+    assert mk.complete_pair_signal(expensive_up, cheap_dn) is None
+    assert mk.exit_signal(expensive_up, cheap_dn) is None
+    now["t"] += 19
+    assert mk.exit_signal(expensive_up, cheap_dn) is None
+    now["t"] += 1
+    # Pair still cannot close at 1.12 (0.46+0.70); sell Down at 0.28.
+    assert mk.complete_pair_signal(expensive_up, cheap_dn) is None
+    sig = mk.exit_signal(expensive_up, cheap_dn)
+    assert sig is not None and sig.kind == "maker-exit"
+    assert sig.legs[0].side == "down" and sig.legs[0].max_price == 0.28
+    fill = ex.sell("DOWN", "down", mk.naked_shares, min_price=0.28, top=cheap_dn)
+    assert fill is not None and fill.size < 0
+    mk.mark_exited([fill])
+    assert mk.exited and mk.naked_side is None
+    assert abs(mk.shares("down")) < 0.01
+    # Leftover Up bid is gone; no second entry.
+    assert mk.orders["up"].done
+    assert mk.step(_book(0.40), _book(0.40)) == []
+
+
+def test_paper_sell_nets_position_and_credits_bankroll():
+    from pm5.bot import Position
+
+    cfg = Config()
+    cfg.mode = "paper"
+    cfg.paper_bankroll = 10.0
+    cfg.taker_fee_rate = 0.07
+    ex = Executor(cfg, reader=None)
+    pos = Position()
+    buy = ex.buy("DOWN", "down", 5.0, 0.46, top=_book(0.46))
+    pos.add(buy)
+    sold = ex.sell("DOWN", "down", buy.size, min_price=0.20, top=_book(0.90, bid=0.20))
+    pos.add(sold)
+    # Net flat: settlement PnL is -(buy cost - sell proceeds), either outcome.
+    assert abs(pos.fills[0].size + pos.fills[1].size) < 0.02
+    pnl_up = pos.settle(up_won=True)
+    pnl_dn = pos.settle(up_won=False)
+    assert abs(pnl_up - pnl_dn) < 0.02
+    assert pnl_up < 0  # we sold cheaper than we bought
+    assert ex.bankroll > 5.0  # sale credited cash back

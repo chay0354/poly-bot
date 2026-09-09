@@ -15,7 +15,7 @@ log = logging.getLogger("pm5.strategy")
 
 @dataclass
 class Signal:
-    kind: str  # "momentum" | "arb"
+    kind: str  # "momentum" | "arb" | "maker" | "maker-pair" | "maker-hedge" | "maker-exit"
     # For momentum: one leg. For arb: two legs (buy both sides).
     legs: list["Leg"]
     reason: str

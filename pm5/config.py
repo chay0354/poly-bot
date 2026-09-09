@@ -112,6 +112,16 @@ class Config:
     # loss with a $stake coin flip attached, so we take the bounded one.
     maker_pair_hard_secs: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_HARD", 20.0))
     maker_pair_hard_sum: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_HARD_SUM", 1.12))
+    # Pull the unfilled bid on the side BTC just moved against (that side is
+    # about to be dumped into our rest). 0 = never. Measured vs the witnessed
+    # window open (same feed the market settles on).
+    maker_defensive_usd: float = field(default_factory=lambda: _f("PM_MAKER_DEFENSIVE_USD", 20.0))
+    # Still naked after this many seconds *and* the pair cannot close at the
+    # hard cap: sell the filled leg at the bid instead of holding $stake to
+    # resolution. 0 = never sell-to-exit.
+    maker_exit_secs: float = field(default_factory=lambda: _f("PM_MAKER_EXIT_SECS", 20.0))
+    # Don't dump into a dust bid; hold if the best bid is below this.
+    maker_exit_min_bid: float = field(default_factory=lambda: _f("PM_MAKER_EXIT_MIN_BID", 0.10))
 
     # --- Fees ---
     # Polymarket crypto taker fee: shares × rate × p × (1-p). Makers pay 0.

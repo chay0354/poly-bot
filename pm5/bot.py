@@ -175,7 +175,9 @@ class Bot:
                     })
 
                 if maker is not None:
-                    fills = maker.step(up_top, down_top)
+                    tick = self.feed.latest
+                    btc = tick.price if tick else None
+                    fills = maker.step(up_top, down_top, btc=btc, open_price=open_price)
                     for f in fills:
                         position.add(f)
                     if fills:
@@ -189,12 +191,17 @@ class Bot:
                         proj = self.feed.projected_close(market.window_end, self.cfg.twap_secs)
                         hedge = maker.hedge_signal(proj, open_price, up_top, down_top)
                     follow = pair or hedge
+                    if follow is None:
+                        follow = maker.exit_signal(up_top, down_top)
                     if follow is not None:
                         fills = self._execute(follow, market)
                         if fills:
                             for f in fills:
                                 position.add(f)
-                            maker.mark_hedged(fills)
+                            if follow.kind == "maker-exit":
+                                maker.mark_exited(fills)
+                            else:
+                                maker.mark_hedged(fills)
                             self._record_fills(market, follow, fills, open_price)
 
                 if trades < self.cfg.max_trades_per_window:
@@ -285,6 +292,8 @@ class Bot:
             return self._announce_signal(signal, market)
         if signal.kind == "arb":
             return self._execute_arb(signal)
+        if signal.kind == "maker-exit":
+            return self._execute_exit(signal)
         side = signal.legs[0].side
         if self._should_log(f"sig:mom:{side}"):
             log.info("SIGNAL[%s] %s", signal.kind, signal.reason)
@@ -300,6 +309,24 @@ class Bot:
                 f"skip:{leg.side}:{self.executor.last_skip}"
             ):
                 log.info("  ↳ %s not taken: %s (still trying)", leg.side, self.executor.last_skip)
+        return fills
+
+    def _execute_exit(self, signal: Signal) -> list[Fill]:
+        side = signal.legs[0].side
+        if self._should_log(f"sig:exit:{side}"):
+            log.info("SIGNAL[%s] %s", signal.kind, signal.reason)
+        fills: list[Fill] = []
+        for leg in signal.legs:
+            shares = round(leg.stake_usdc / leg.max_price, 2) if leg.max_price else 0.0
+            fill = self.executor.sell(
+                leg.token_id, leg.side, shares, min_price=leg.max_price, top=leg.top,
+            )
+            if fill is not None:
+                fills.append(fill)
+            elif self.executor.last_skip and self._should_log(
+                f"skip:exit:{leg.side}:{self.executor.last_skip}"
+            ):
+                log.info("  ↳ %s not sold: %s (still trying)", leg.side, self.executor.last_skip)
         return fills
 
     def _announce_signal(self, signal: Signal, market: Market | None) -> list[Fill]:
