@@ -207,8 +207,11 @@ This is a **long-running worker**, not a website. Do **not** deploy to Vercel.
 
    Run **only one** live worker. Stop any local `run.py` first or you will double-trade.
 
-5. Use an **always-on** worker (no sleep). There is no HTTP port to bind.
+5. Use an **always-on** worker (no sleep). The bot service has no HTTP port.
 6. After deploy, logs should show `starting in LIVE mode` and `price feed connected`.
+7. **Dashboard (optional second service):** same image, start command
+   `python -u dashboard.py`. Railway sets `PORT`. Add `SUPABASE_URL` and
+   `SUPABASE_SECRET_KEY`. Do **not** put the private key on this service.
 
 If Railway offers a "web" vs **worker** process, pick worker / empty start command override so it runs `python -u run.py` from `railway.toml`.
 

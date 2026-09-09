@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+import os
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -19,7 +20,8 @@ from pm5.supabase_log import SupabaseLog
 
 # Israel (IDT). Avoids the tzdata package on Windows.
 IL = timezone(timedelta(hours=3))
-HOST, PORT = "127.0.0.1", 8787
+HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT") or os.getenv("DASHBOARD_PORT") or "8787")
 
 
 def _now() -> float:
