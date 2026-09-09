@@ -6,13 +6,12 @@ Makers pay no fee and earn rebates, so:
 
 * both bids hit  -> we hold one Up + one Down per share pair; the market pays
   $1 per pair no matter what. Cost 0.92, payout 1.00: locked-in profit.
-* one bid hits   -> keep the other bid on the book (do not cancel it at the
-  usual T-75 cutoff). If the other ask is cheap enough that
-  fill_price + ask <= 1, take it immediately and lock the pair. After a short
-  grace period still naked, take it while the sum <= maker_pair_max_sum (a
-  small known loss instead of a coin flip). If the other side never comes
-  back, sell the filled leg rather than hold a coin flip. TWAP hedge is the
-  last fallback.
+* one bid hits   -> keep the other 0.46 bid on the book and *wait for it*.
+  Instant taker-complete at ask 0.54 looks like a $1 lock but the 7% taker
+  fee makes it -EV; that was the 3/5 leak. Only take the other side as a
+  taker if that leftover bid is already gone *and* fill+ask+fee ≤ $1 (or
+  the configured grace/hard cap). If it never comes back, sell the filled
+  leg rather than pay 1.04–1.12. TWAP hedge is the last fallback.
 * BTC dumps vs the open while a bid is still resting -> cancel the side being
   dumped into before it fills (defensive cancel).
 * nothing hits   -> cancel at `maker_cancel_left_secs`, nothing spent.
@@ -27,7 +26,7 @@ from __future__ import annotations
 import logging
 import time
 
-from .clob import BookTop, Executor, Fill, RestingOrder
+from .clob import BookTop, Executor, Fill, RestingOrder, taker_fee_usdc
 from .config import Config
 from .markets import Market
 from .pricefeed import TwapProjection
@@ -150,12 +149,16 @@ class MakerPair:
     ) -> Signal | None:
         """If one side filled, take the other side to close the pair.
 
-        The price we accept ramps with how long we have been naked:
-          * at once            -> avg_fill + ask <= 1.00 (profit locked)
-          * after grace secs   -> <= maker_pair_max_sum  (small known loss)
-          * after hard secs    -> <= maker_pair_hard_sum (bigger known loss)
-        A first fill is usually the side being dumped, so waiting only lets the
-        other side get dearer; a bounded loss beats a $stake coin flip.
+        While the leftover maker bid is still live we do nothing — that 0.46
+        fill is the actual edge. A taker buy at 0.52–0.54 plus the 7% fee
+        turns a locked $1 into a loss (the live 3/5 leak).
+
+        Only after that bid is gone does the price ramp apply, and the sum
+        always includes the taker fee per share:
+          * at once            -> avg + ask + fee <= 1.00
+          * after grace secs   -> <= maker_pair_max_sum
+          * after hard secs    -> <= maker_pair_hard_sum
+        Defaults keep those caps at 1.00; sell-to-exit covers the rest.
         """
         if self.hedged or self.exited:
             return None
@@ -163,12 +166,17 @@ class MakerPair:
         if side is None:
             return None
         other = "down" if side == "up" else "up"
+        if self._bid_live(other):
+            return None
         top = down_top if other == "down" else up_top
         if top is None or top.best_ask is None:
             return None
         avg = self._avg_price(side)
         if avg is None:
             return None
+        ask = top.best_ask
+        fee = taker_fee_usdc(1.0, ask, self.cfg.taker_fee_rate)
+        all_in = avg + ask + fee
         limit = 1.0
         if self._naked_since is not None:
             age = self._clock() - self._naked_since
@@ -176,7 +184,7 @@ class MakerPair:
                 limit = max(1.0, self.cfg.maker_pair_hard_sum)
             elif age >= self.cfg.maker_pair_grace_secs:
                 limit = max(1.0, self.cfg.maker_pair_max_sum)
-        if avg + top.best_ask > limit + 1e-9:
+        if all_in > limit + 1e-9:
             return None
         qty = self.naked_shares
         return Signal(
@@ -184,13 +192,13 @@ class MakerPair:
             legs=[Leg(
                 side=other,
                 token_id=self.market.token_for(other),
-                max_price=top.best_ask,
-                stake_usdc=round(qty * top.best_ask, 2),
+                max_price=ask,
+                stake_usdc=round(qty * ask, 2),
                 top=top,
             )],
             reason=(
                 f"complete pair: naked {side} @ {avg:.2f} + {other} "
-                f"ask {top.best_ask:.2f} = {avg + top.best_ask:.2f} ≤ {limit:.2f}"
+                f"ask {ask:.2f} + fee {fee:.3f} = {all_in:.3f} ≤ {limit:.2f}"
             ),
         )
 
@@ -365,6 +373,10 @@ class MakerPair:
 
     def _live_orders(self) -> list[RestingOrder]:
         return [o for o in self.orders.values() if not o.done]
+
+    def _bid_live(self, side: str) -> bool:
+        order = self.orders.get(side)
+        return order is not None and not order.done
 
     def _post(self) -> None:
         """Rest any missing bid. Only mark posted once BOTH sides are on the book.

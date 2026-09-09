@@ -100,18 +100,13 @@ class Config:
     # If exactly one side filled and the TWAP projection says it is losing,
     # buy the other side (taker) up to this ask to cap the loss. 0 = never hedge.
     maker_hedge_max_price: float = field(default_factory=lambda: _f("PM_MAKER_HEDGE_MAX", 0.60))
-    # Never sit on a naked leg: once one bid fills, take the other side as a
-    # taker the moment avg_fill + ask <= 1.00 (profit locked). If that never
-    # comes, after PM_MAKER_PAIR_GRACE seconds naked accept a small *known*
-    # loss instead of a coin flip: take it while avg_fill + ask <= PAIR_MAX_SUM
-    # (1.04 = lose at most 4c per share pair).
+    # Leftover maker bid gets first chance. Taker-complete only after that
+    # bid is gone, and only when avg + ask + taker_fee <= the cap (1.00 is
+    # a true lock; anything above is a known loss — prefer sell-to-exit).
     maker_pair_grace_secs: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_GRACE", 5.0))
-    maker_pair_max_sum: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_MAX_SUM", 1.04))
-    # Still naked after PM_MAKER_PAIR_HARD seconds: pay up to HARD_SUM to close
-    # the pair (1.12 = at most 12c/share). Holding on is the same expected
-    # loss with a $stake coin flip attached, so we take the bounded one.
+    maker_pair_max_sum: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_MAX_SUM", 1.00))
     maker_pair_hard_secs: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_HARD", 20.0))
-    maker_pair_hard_sum: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_HARD_SUM", 1.12))
+    maker_pair_hard_sum: float = field(default_factory=lambda: _f("PM_MAKER_PAIR_HARD_SUM", 1.00))
     # Pull the unfilled bid on the side BTC just moved against (that side is
     # about to be dumped into our rest). 0 = never. Measured vs the witnessed
     # window open (same feed the market settles on).

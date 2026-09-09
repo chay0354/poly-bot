@@ -193,9 +193,9 @@ This is a **long-running worker**, not a website. Do **not** deploy to Vercel.
    | `PM_MAKER_BID` | `0.46` |
    | `PM_MAKER_STAKE_USDC` | `5` |
    | `PM_MAKER_PAIR_GRACE` | `5` |
-   | `PM_MAKER_PAIR_MAX_SUM` | `1.04` |
+   | `PM_MAKER_PAIR_MAX_SUM` | `1.00` |
    | `PM_MAKER_PAIR_HARD` | `20` |
-   | `PM_MAKER_PAIR_HARD_SUM` | `1.12` |
+   | `PM_MAKER_PAIR_HARD_SUM` | `1.00` |
    | `PM_MAKER_DEFENSIVE_USD` | `20` |
    | `PM_MAKER_EXIT_SECS` | `20` |
    | `PM_MAKER_EXIT_MIN_BID` | `0.10` |
@@ -247,9 +247,9 @@ If Railway offers a "web" vs **worker** process, pick worker / empty start comma
 | `PM_MAKER_CANCEL_LEFT` | `75` | Cancel unfilled bids with this many seconds left |
 | `PM_MAKER_HEDGE_MAX` | `0.60` | Hedge a losing lone leg up to this ask (0 = never) |
 | `PM_MAKER_PAIR_GRACE` | `5` | Seconds naked before allowing pair sum ≤ MAX_SUM |
-| `PM_MAKER_PAIR_MAX_SUM` | `1.04` | Close the pair up to this fill+ask after grace |
+| `PM_MAKER_PAIR_MAX_SUM` | `1.00` | Close the pair up to this fill+ask+fee after grace |
 | `PM_MAKER_PAIR_HARD` | `20` | Seconds naked before allowing pair sum ≤ HARD_SUM |
-| `PM_MAKER_PAIR_HARD_SUM` | `1.12` | Last-resort pair close (bounded loss) |
+| `PM_MAKER_PAIR_HARD_SUM` | `1.00` | Last-resort pair close (all-in, including taker fee) |
 | `PM_MAKER_DEFENSIVE_USD` | `20` | Cancel the unfilled dumped-side bid after this BTC move vs open (0 = off) |
 | `PM_MAKER_EXIT_SECS` | `20` | Seconds naked before selling the filled leg if the pair cannot close (0 = off) |
 | `PM_MAKER_EXIT_MIN_BID` | `0.10` | Don't sell-to-exit into a bid below this |

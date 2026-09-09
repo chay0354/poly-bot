@@ -259,16 +259,41 @@ def test_maker_retries_missing_leg_on_onesided_book():
     assert "down" in mk.orders
 
 
+def test_maker_waits_for_leftover_maker_bid():
+    cfg, ex, m, mk = _maker()
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.46), _book(0.56))  # Up hit; Down 0.46 bid still live
+    # Cheap Down ask would have been an instant taker lock — do not take it
+    # while the leftover maker bid can still fill at 0.46.
+    assert mk.complete_pair_signal(_book(0.90), _book(0.50)) is None
+    assert not mk.orders["down"].done
+
+
 def test_maker_completes_pair_when_other_ask_locks():
     cfg, ex, m, mk = _maker()
     mk.step(_book(0.52), _book(0.52))
     mk.step(_book(0.46), _book(0.56))
+    ex.cancel_bid(mk.orders["down"])  # leftover bid gone; now a taker lock is ok
     sig = mk.complete_pair_signal(_book(0.90), _book(0.50))
     assert sig is not None and sig.kind == "maker-pair"
     assert sig.legs[0].side == "down"
     assert sig.legs[0].max_price == 0.50
-    # Other ask too expensive to lock (0.46+0.60 > 1).
+    # 0.46+0.54 + fee ≈ 1.017 > 1.00 — the "locked profit" that was actually -EV.
+    assert mk.complete_pair_signal(_book(0.90), _book(0.54)) is None
+    # Other ask too expensive even before fee (0.46+0.60 > 1).
     assert mk.complete_pair_signal(_book(0.90), _book(0.60)) is None
+
+
+def test_maker_pair_counts_taker_fee_in_the_lock():
+    cfg, ex, m, mk = _maker()
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.46), _book(0.56))
+    ex.cancel_bid(mk.orders["down"])
+    # Headline 0.46+0.53 = 0.99 looks locked; fee (~1.7c) pushes it over $1.
+    assert mk.complete_pair_signal(_book(0.90), _book(0.53)) is None
+    # Cheap enough that fill+ask+fee still ≤ 1.00.
+    sig = mk.complete_pair_signal(_book(0.90), _book(0.50))
+    assert sig is not None and sig.legs[0].max_price == 0.50
 
 
 def test_maker_accepts_small_loss_pair_after_grace():
@@ -279,16 +304,17 @@ def test_maker_accepts_small_loss_pair_after_grace():
     now = {"t": 1000.0}
     mk._clock = lambda: now["t"]
     mk.step(_book(0.52), _book(0.52))
-    mk.step(_book(0.46), _book(0.57))  # Up hit; Down ask 0.57 -> sum 1.03
+    mk.step(_book(0.46), _book(0.56))  # Up hit; Down ask 0.56 -> 1.02 + fee ≈ 1.037
+    ex.cancel_bid(mk.orders["down"])
     # Fresh naked leg: only a <= 1.00 pair is taken.
-    assert mk.complete_pair_signal(_book(0.90), _book(0.57)) is None
+    assert mk.complete_pair_signal(_book(0.90), _book(0.56)) is None
     now["t"] += 14
-    assert mk.complete_pair_signal(_book(0.90), _book(0.57)) is None
-    # Grace over: lock the pair for a known 3c/share loss instead of a coin flip.
+    assert mk.complete_pair_signal(_book(0.90), _book(0.56)) is None
+    # Grace over: lock the pair for a known ~4c/share all-in loss.
     now["t"] += 1
-    sig = mk.complete_pair_signal(_book(0.90), _book(0.57))
-    assert sig is not None and sig.legs[0].side == "down" and sig.legs[0].max_price == 0.57
-    # But never beyond the cap (0.46 + 0.59 = 1.05 > 1.04).
+    sig = mk.complete_pair_signal(_book(0.90), _book(0.56))
+    assert sig is not None and sig.legs[0].side == "down" and sig.legs[0].max_price == 0.56
+    # But never beyond the cap (0.46 + 0.59 + fee > 1.04).
     assert mk.complete_pair_signal(_book(0.90), _book(0.59)) is None
 
 
@@ -303,6 +329,7 @@ def test_maker_hard_cap_closes_pair_when_other_side_ran_away():
     mk._clock = lambda: now["t"]
     mk.step(_book(0.52), _book(0.52))
     mk.step(_book(0.46), _book(0.62))  # Up hit; Down ask 0.62 -> sum 1.08
+    ex.cancel_bid(mk.orders["down"])
     assert mk.complete_pair_signal(_book(0.90), _book(0.62)) is None
     now["t"] += 10  # past grace, sum 1.08 > 1.04 -> still waiting
     assert mk.complete_pair_signal(_book(0.90), _book(0.62)) is None
