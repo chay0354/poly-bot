@@ -48,6 +48,9 @@ class MakerPair:
         self.exited = False
         self._warned_onesided = False
         self._warned_feed = False
+        self._warned_incomplete = False
+        self._feed_hold = False  # hysteresis so Δ 25→19 does not re-post
+        self._stood_down = False  # yanked an unfilled pair this window
         self._naked_since: float | None = None  # monotonic time we became one-sided
         self._blocked: set[str] = set()  # sides we will not re-post (defensive pull)
         self._clock = time.monotonic
@@ -106,8 +109,10 @@ class MakerPair:
             toxic = self._toxic_side(btc, open_price)
             if toxic is not None:
                 self._blocked.add(toxic)
-            already_in = bool(self.orders or self.fills)
-            if toxic is not None and not self.fills:
+            already_in = bool(self.fills or self._live_orders())
+            if self._stood_down and not self.fills:
+                pass  # already yanked an unfilled pair; sit out the rest
+            elif toxic is not None and not self.fills:
                 # Book can still look 0.50/0.50 after a $20 Chainlink move.
                 # Posting the pair then yanking one side leaves a naked rest
                 # (14:55: posted both, cancelled Down at Δ=+28, Up filled).
@@ -338,6 +343,7 @@ class MakerPair:
             for o in live:
                 self.executor.cancel_bid(o)
                 self._blocked.add(o.side)
+            self._stood_down = True
             return
         if self.shares(toxic) > 0.01:
             return
@@ -354,8 +360,15 @@ class MakerPair:
         if self.cfg.maker_defensive_usd <= 0 or btc is None or open_price is None:
             return None
         delta = btc - open_price
-        if abs(delta) < self.cfg.maker_defensive_usd:
+        # 15:10: waited at +25.3, posted at a one-tick dip, then yanked at +24.
+        # Once decided, stay decided until BTC is clearly back (75% of threshold).
+        limit = self.cfg.maker_defensive_usd
+        if self._feed_hold:
+            limit = limit * 0.75
+        if abs(delta) < limit:
+            self._feed_hold = False
             return None
+        self._feed_hold = True
         return "down" if delta > 0 else "up"
 
     def _pull_overfill_bids(self, why: str) -> None:
@@ -423,6 +436,7 @@ class MakerPair:
         tick = m.tick_size or 0.01
         px = self.cfg.maker_bid
         shares = self._wanted_shares()
+        attempted = 0
         for side in ("up", "down"):
             if side in self._blocked:
                 continue
@@ -431,6 +445,7 @@ class MakerPair:
             existing = self.orders.get(side)
             if existing is not None and not existing.done:
                 continue
+            attempted += 1
             order = self.executor.place_bid(
                 m.token_for(side), side, px, shares, tick, m.neg_risk,
             )
@@ -445,10 +460,14 @@ class MakerPair:
         if live_or_filled == 2 or (self.shares("up") > 0 and self.shares("down") > 0):
             self.posted = True
             return
-        log.warning(
-            "maker: rest incomplete (%d/2 on book); will retry",
-            live_or_filled,
-        )
+        if attempted == 0:
+            return
+        if not self._warned_incomplete:
+            self._warned_incomplete = True
+            log.warning(
+                "maker: rest incomplete (%d/2 on book); will retry",
+                live_or_filled,
+            )
 
     def _maybe_cancel(self, left: float) -> None:
         if self.cancelled:

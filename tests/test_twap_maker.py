@@ -386,6 +386,29 @@ def test_maker_does_not_post_when_feed_already_moved():
     cfg.maker_defensive_usd = 20
     mk.step(_book(0.52), _book(0.52), btc=50028.0, open_price=50000.0)
     assert mk.orders == {} and not mk.posted
+    # 15:10: Δ dipped under $20 for a tick — still hold, do not rest.
+    mk.step(_book(0.52), _book(0.52), btc=50019.0, open_price=50000.0)
+    assert mk.orders == {} and not mk.posted
+
+
+def test_maker_does_not_repost_after_defensive_yank():
+    """After a +24 cancel, cancelled orders must not retrigger _post spam."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_defensive_usd = 20
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.52), _book(0.52), btc=50024.0, open_price=50000.0)
+    assert mk._stood_down and all(o.done for o in mk.orders.values())
+    attempts = {"n": 0}
+    real = ex.place_bid
+
+    def count(*args, **kwargs):
+        attempts["n"] += 1
+        return real(*args, **kwargs)
+
+    ex.place_bid = count
+    mk.step(_book(0.52), _book(0.52), btc=50010.0, open_price=50000.0)
+    mk.step(_book(0.52), _book(0.52))
+    assert attempts["n"] == 0
 
 
 def test_maker_defensive_keeps_other_bid_after_fill():
