@@ -21,6 +21,7 @@ import httpx
 from . import net
 from .clob import BookReader, Executor, Fill
 from .config import Config
+from .fastfeed import BinanceFeed
 from .maker import MakerPair
 from .markets import Market, MarketDiscovery, current_window_start
 from .pricefeed import ChainlinkFeed
@@ -63,6 +64,7 @@ class Bot:
         self.reader = BookReader(cfg.clob_url, self._http)
         self.executor = Executor(cfg, self.reader)
         self.feed = ChainlinkFeed(cfg.ws_live_url, net.WS_LIVE_HOST)
+        self.fast = BinanceFeed(cfg.fast_feed_url) if cfg.fast_feed else None
         self.momentum = MomentumStrategy(cfg, self.feed)
         self.arb = ArbitrageStrategy(cfg, self.reader)
         self.recorder = Recorder(cfg.data_file, enabled=cfg.record, mode=cfg.mode)
@@ -71,10 +73,13 @@ class Bot:
 
     async def run(self) -> None:
         feed_task = asyncio.create_task(self.feed.run())
+        fast_task = asyncio.create_task(self.fast.run()) if self.fast is not None else None
         ok = await self.feed.wait_connected(timeout=20)
         if not ok:
             log.error("price feed did not connect; aborting")
             feed_task.cancel()
+            if fast_task is not None:
+                fast_task.cancel()
             return
         bank = self.executor.bankroll
         if self.cfg.mode == "signal":
@@ -107,6 +112,8 @@ class Bot:
                 await self._trade_window()
         finally:
             feed_task.cancel()
+            if fast_task is not None:
+                fast_task.cancel()
             self.recorder.close()
 
     def _min_trade_cost(self) -> float:
@@ -178,9 +185,13 @@ class Bot:
                 if maker is not None:
                     tick = self.feed.latest
                     btc = tick.price if tick else None
+                    fast_delta = (
+                        self.fast.delta_since(market.window_start)
+                        if self.fast is not None else None
+                    )
                     fills = maker.step(
                         up_top, down_top, btc=btc, open_price=open_price,
-                        sigma=self.feed.realized_vol(300.0),
+                        sigma=self.feed.realized_vol(300.0), fast_delta=fast_delta,
                     )
                     for f in fills:
                         position.add(f)

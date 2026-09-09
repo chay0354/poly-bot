@@ -45,6 +45,12 @@ class Config:
     clob_url: str = "https://clob.polymarket.com"
     gamma_url: str = "https://gamma-api.polymarket.com"
     ws_live_url: str = "wss://ws-live-data.polymarket.com"
+    # Binance trade stream as an early warning for the maker's defensive
+    # cancel (market makers price off it and it leads Chainlink by seconds).
+    # Settlement and the open stay on Chainlink. Falls back silently if down.
+    fast_feed: bool = field(default_factory=lambda: _b("PM_FAST_FEED", True))
+    fast_feed_url: str = field(default_factory=lambda: os.getenv(
+        "PM_FAST_FEED_URL", "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"))
 
     # --- Risk / sizing ---
     stake_usdc: float = field(default_factory=lambda: _f("PM_STAKE_USDC", 5.0))
@@ -96,7 +102,9 @@ class Config:
     # If a side is already offered at/below our bid (book 0.45/0.56 at T+3s),
     # rest that side one tick under its ask instead of sitting out, down to
     # bid − give (0.42 for 0.46). The pair then costs ≤ 0.92, never more.
-    maker_bid_give: float = field(default_factory=lambda: _f("PM_MAKER_BID_GIVE", 0.04))
+    # 0.04 let us rest at 0.42; both such fills (19:25, 19:31) were the worst
+    # losses of the day — a 0.43 ask is a side already sliding.
+    maker_bid_give: float = field(default_factory=lambda: _f("PM_MAKER_BID_GIVE", 0.02))
     # Post the bids this many seconds after the window opens (let the book form).
     # 10s was too late on a fast tape: by then the book has tilted and BTC has
     # moved past the defensive line, so we never rested at all (9 Sep session).

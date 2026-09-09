@@ -54,6 +54,8 @@ class MakerPair:
         self._naked_since: float | None = None  # monotonic time we became one-sided
         self._blocked: set[str] = set()  # sides we will not re-post (defensive pull)
         self._limit = cfg.maker_defensive_usd  # current toxic-move line (USD)
+        self._fast_delta: float | None = None  # Binance move since open, if known
+        self._delta_src = "chainlink"
         self._skip: str | None = None  # why we have not rested yet (for close())
         self._clock = time.monotonic
 
@@ -97,16 +99,20 @@ class MakerPair:
         btc: float | None = None,
         open_price: float | None = None,
         sigma: float | None = None,
+        fast_delta: float | None = None,
     ) -> list[Fill]:
         """Post / poll / cancel resting bids. Returns any new fills.
 
         `sigma` is the feed's realized 5-min move; it widens the defensive line
         on a fast tape so noise does not keep us out of every window.
+        `fast_delta` is Binance's move since the open — the leading signal for
+        the defensive cancel when available.
         """
         m = self.market
         left = m.seconds_left
         tops = {"up": up_top, "down": down_top}
         self._limit = self._defensive_limit(left, sigma)
+        self._fast_delta = fast_delta
 
         if (
             not self.hedged
@@ -122,18 +128,23 @@ class MakerPair:
                 # Book can still look 0.50/0.50 after a $20 Chainlink move.
                 # Posting the pair then yanking one side leaves a naked rest
                 # (14:55: posted both, cancelled Down at Δ=+28, Up filled).
-                self._skip = f"BTC Δopen={btc - open_price:+.1f} ≥ {self._limit:.0f}"
+                d = self._delta(btc, open_price) or 0.0
+                self._skip = f"BTC Δopen={d:+.1f} ≥ {self._limit:.0f} ({self._delta_src})"
                 if not self._warned_feed:
                     self._warned_feed = True
                     log.info(
-                        "maker: BTC already Δopen=%+.1f (line %.0f); waiting for a "
+                        "maker: BTC already Δopen=%+.1f (line %.0f, %s); waiting for a "
                         "quiet open before resting a pair",
-                        btc - open_price, self._limit,
+                        d, self._limit, self._delta_src,
                     )
             elif already_in and not self.posted:
-                # One leg is on / filled: always retry the missing bid, even
-                # if the book has gone one-sided (that is how we get stuck naked).
-                self._post(tops, relax=True)
+                # One leg is on / filled: retry the missing bid even if the
+                # book has gone one-sided (that is how we get stuck naked).
+                # Drop the price floor only if the other leg actually FILLED:
+                # then a cheap complement is a cheaper pair. If it is merely
+                # resting, a 0.24 bid on the collapsing side is just buying
+                # the dumped side (19:15: Down @0.24, sold @0.20).
+                self._post(tops, relax=bool(self.fills))
             elif not self.posted and left <= self.cfg.maker_cancel_left_secs:
                 if self._skip is None:
                     self._skip = f"joined too late (T-{left:.0f}s)"
@@ -397,7 +408,8 @@ class MakerPair:
         toxic = self._toxic_side(btc, open_price)
         if toxic is None:
             return found
-        delta = btc - open_price
+        delta = self._delta(btc, open_price) or 0.0
+        src = self._delta_src
         if not self.fills:
             live = [o for o in self.orders.values() if not o.done]
             if not live:
@@ -405,8 +417,8 @@ class MakerPair:
                 # if the move fades we want to rest the full pair, not one leg.
                 return found
             log.info(
-                "maker: defensive cancel pair (BTC Δopen=%+.1f ≥ %.0f, nothing filled)",
-                delta, self._limit,
+                "maker: defensive cancel pair (BTC Δopen=%+.1f ≥ %.0f, %s, nothing filled)",
+                delta, self._limit, src,
             )
             for o in live:
                 fill = self._cancel_one(o, "defensive pair")
@@ -427,18 +439,35 @@ class MakerPair:
         if order is None or order.done:
             return found
         log.info(
-            "maker: defensive cancel %s bid (BTC Δopen=%+.1f ≥ %.0f)",
-            toxic, delta, self._limit,
+            "maker: defensive cancel %s bid (BTC Δopen=%+.1f ≥ %.0f, %s)",
+            toxic, delta, self._limit, src,
         )
         fill = self._cancel_one(order, "defensive toxic")
         if fill is not None:
             found.append(fill)
         return found
 
-    def _toxic_side(self, btc: float | None, open_price: float | None) -> str | None:
-        if self.cfg.maker_defensive_usd <= 0 or btc is None or open_price is None:
+    def _delta(self, btc: float | None, open_price: float | None) -> float | None:
+        """Move since the open for the defensive logic.
+
+        Binance when we have it (it is what the makers hitting us look at),
+        Chainlink otherwise. We do not mix them: a lagging Chainlink +30 after
+        Binance already reverted to +5 is not a dump in progress.
+        """
+        if self._fast_delta is not None:
+            self._delta_src = "binance"
+            return self._fast_delta
+        self._delta_src = "chainlink"
+        if btc is None or open_price is None:
             return None
-        delta = btc - open_price
+        return btc - open_price
+
+    def _toxic_side(self, btc: float | None, open_price: float | None) -> str | None:
+        if self.cfg.maker_defensive_usd <= 0:
+            return None
+        delta = self._delta(btc, open_price)
+        if delta is None:
+            return None
         # 15:10: waited at +25.3, posted at a one-tick dip, then yanked at +24.
         # Once decided, stay decided until BTC is clearly back (75% of threshold).
         limit = self._limit

@@ -254,9 +254,13 @@ def test_maker_retries_missing_leg_on_onesided_book():
     ex.place_bid = flaky
     mk.step(_book(0.52), _book(0.52))
     assert set(mk.orders) == {"up"}
-    # Book goes one-sided: we still retry Down because we already have a leg.
+    # Down has collapsed to 0.42 while Up is only *resting*: do not chase it
+    # (a 0.41 bid there just buys the dumped side).
     mk.step(_book(0.58), _book(0.42))
-    assert "down" in mk.orders
+    assert "down" not in mk.orders
+    # Book comes back near fair: the missing leg is retried at once.
+    mk.step(_book(0.52), _book(0.50))
+    assert "down" in mk.orders and mk.posted
 
 
 def test_maker_waits_for_leftover_maker_bid():
@@ -412,6 +416,59 @@ def test_maker_exit_sells_exact_naked_shares():
     # stake/price re-rounding gives 10.88 -> the CLOB rejects that.
     leg = sig.legs[0]
     assert round(leg.stake_usdc / leg.max_price, 2) == 10.88
+
+
+def test_fast_feed_parses_binance_and_reports_delta_since_open():
+    from pm5.fastfeed import BinanceFeed
+
+    f = BinanceFeed("wss://x")
+    now_ms = int(time.time() * 1000)
+    f._ingest('{"e":"aggTrade","s":"BTCUSDT","p":"78800.5","T":%d}' % (now_ms - 4000))
+    f._ingest('{"e":"aggTrade","s":"BTCUSDT","p":"78831.0","T":%d}' % now_ms)
+    f._ingest("garbage")
+    assert f.fresh
+    assert f.delta_since(time.time() - 5) == 30.5
+    # No trade at/after the open we were asked about -> honest None.
+    assert f.delta_since(time.time() + 60) is None
+    f.latest = Tick(78831.0, time.time() - 30, time.time() - 30)
+    assert not f.fresh and f.delta_since(time.time() - 60) is None
+
+
+def test_maker_defensive_cancel_uses_binance_lead():
+    """Chainlink still shows +6 while Binance is already +31: pull Down now."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_defensive_usd = 20
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.52), _book(0.52), btc=50006.0, open_price=50000.0, fast_delta=31.0)
+    assert mk.orders["down"].done and mk.orders["up"].done
+    assert mk._delta_src == "binance"
+    # Binance reverted to +3 even though Chainlink lags at +30: not toxic.
+    cfg, ex, m, mk = _maker()
+    cfg.maker_defensive_usd = 20
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.52), _book(0.52), btc=50030.0, open_price=50000.0, fast_delta=3.0)
+    assert not mk.orders["down"].done and not mk.orders["up"].done
+
+
+def test_maker_does_not_chase_collapsing_side_for_a_resting_leg():
+    """19:15: Up merely resting, Down ask collapsed to 0.25 -> we bid 0.24 and ate it."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_bid_give = 0.02
+    mk.step(_book(0.52), _book(0.52))
+    # Down bid never filled; Down ask collapses. Up still just resting.
+    mk.orders["down"].done = True
+    mk.posted = False
+    mk.step(_book(0.76), _book(0.25))
+    assert mk.orders["down"].done  # no new Down bid at 0.24
+    # But if Up had FILLED, a 0.24 Down completes the pair at 0.70: take it.
+    cfg, ex, m, mk = _maker()
+    cfg.maker_bid_give = 0.02
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.46), _book(0.56))  # Up filled
+    mk.orders["down"].done = True
+    mk.posted = False
+    mk.step(_book(0.76), _book(0.25))
+    assert not mk.orders["down"].done and mk.orders["down"].price == 0.24
 
 
 def test_maker_steps_under_a_low_ask_instead_of_sitting_out():
