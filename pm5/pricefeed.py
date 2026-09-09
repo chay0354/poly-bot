@@ -228,6 +228,28 @@ class ChainlinkFeed:
         proj = (known * known_mean + remaining * self.latest.price) / lookback
         return TwapProjection(proj, known, remaining, known_mean, self.latest.price)
 
+    def realized_vol(self, secs: float) -> float | None:
+        """Realized move (USD) over a `secs` horizon, from the trailing ticks.
+
+        Sum of squared tick-to-tick changes over the last `secs` of source
+        time, rescaled to a full `secs` horizon. Tells the maker whether a
+        $20 move is noise (BTC swinging $300 per window) or a real decision
+        (quiet tape). None until at least half the horizon is covered.
+        """
+        if not self.latest or len(self._history) < 2:
+            return None
+        cutoff = self.latest.src_ts - secs
+        prev = None
+        rv = 0.0
+        for t in self._history:
+            if prev is not None and t.src_ts >= cutoff:
+                rv += (t.price - prev.price) ** 2
+            prev = t
+        covered = self.latest.src_ts - max(cutoff, self._history[0].src_ts)
+        if covered < secs * 0.5:
+            return None
+        return (rv * secs / covered) ** 0.5
+
     def momentum(self, lookback_secs: float) -> float | None:
         """Signed price change over the last `lookback_secs` of history."""
         if not self.latest or not self._history:

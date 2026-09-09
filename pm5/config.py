@@ -94,7 +94,9 @@ class Config:
     maker_bid: float = field(default_factory=lambda: _f("PM_MAKER_BID", 0.46))
     maker_stake_usdc: float = field(default_factory=lambda: _f("PM_MAKER_STAKE_USDC", 5.0))
     # Post the bids this many seconds after the window opens (let the book form).
-    maker_start_secs: float = field(default_factory=lambda: _f("PM_MAKER_START", 10.0))
+    # 10s was too late on a fast tape: by then the book has tilted and BTC has
+    # moved past the defensive line, so we never rested at all (9 Sep session).
+    maker_start_secs: float = field(default_factory=lambda: _f("PM_MAKER_START", 3.0))
     # Cancel whatever is still unfilled when this many seconds are left.
     maker_cancel_left_secs: float = field(default_factory=lambda: _f("PM_MAKER_CANCEL_LEFT", 75.0))
     # If exactly one side filled and the TWAP projection says it is losing,
@@ -111,6 +113,10 @@ class Config:
     # about to be dumped into our rest). 0 = never. Measured vs the witnessed
     # window open (same feed the market settles on).
     maker_defensive_usd: float = field(default_factory=lambda: _f("PM_MAKER_DEFENSIVE_USD", 20.0))
+    # The dollar line above is a floor. The real line scales with the tape:
+    # z × realized 5-min move × sqrt(time left / 300). z=0.15 ≈ "the side's
+    # fair value has dropped to ~0.44 vs our 0.46 bid". 0 = fixed dollars only.
+    maker_defensive_z: float = field(default_factory=lambda: _f("PM_MAKER_DEFENSIVE_Z", 0.15))
     # Still naked after this many seconds *and* the pair cannot close at the
     # hard cap: sell the filled leg at the bid instead of holding $stake to
     # resolution. 0 = never sell-to-exit.

@@ -53,6 +53,8 @@ class MakerPair:
         self._stood_down = False  # yanked an unfilled pair this window
         self._naked_since: float | None = None  # monotonic time we became one-sided
         self._blocked: set[str] = set()  # sides we will not re-post (defensive pull)
+        self._limit = cfg.maker_defensive_usd  # current toxic-move line (USD)
+        self._skip: str | None = None  # why we have not rested yet (for close())
         self._clock = time.monotonic
 
     # ----------------------------------------------------------------- state
@@ -94,11 +96,17 @@ class MakerPair:
         down_top: BookTop | None,
         btc: float | None = None,
         open_price: float | None = None,
+        sigma: float | None = None,
     ) -> list[Fill]:
-        """Post / poll / cancel resting bids. Returns any new fills."""
+        """Post / poll / cancel resting bids. Returns any new fills.
+
+        `sigma` is the feed's realized 5-min move; it widens the defensive line
+        on a fast tape so noise does not keep us out of every window.
+        """
         m = self.market
         left = m.seconds_left
         tops = {"up": up_top, "down": down_top}
+        self._limit = self._defensive_limit(left, sigma)
 
         if (
             not self.hedged
@@ -111,17 +119,18 @@ class MakerPair:
                 self._blocked.add(toxic)
             already_in = bool(self.fills or self._live_orders())
             if self._stood_down and not self.fills:
-                pass  # already yanked an unfilled pair; sit out the rest
+                self._skip = "stood down after defensive yank"
             elif toxic is not None and not self.fills:
                 # Book can still look 0.50/0.50 after a $20 Chainlink move.
                 # Posting the pair then yanking one side leaves a naked rest
                 # (14:55: posted both, cancelled Down at Δ=+28, Up filled).
+                self._skip = f"BTC Δopen={btc - open_price:+.1f} ≥ {self._limit:.0f}"
                 if not self._warned_feed:
                     self._warned_feed = True
                     log.info(
-                        "maker: BTC already Δopen=%+.1f; waiting for a quiet "
-                        "open before resting a pair",
-                        btc - open_price,
+                        "maker: BTC already Δopen=%+.1f (line %.0f); waiting for a "
+                        "quiet open before resting a pair",
+                        btc - open_price, self._limit,
                     )
             elif already_in and not self.posted:
                 # One leg is on / filled: always retry the missing bid, even
@@ -130,11 +139,13 @@ class MakerPair:
             elif not self.posted and left > self.cfg.maker_cancel_left_secs:
                 if self._book_undecided(tops):
                     self._post()
-                elif not self._warned_onesided:
-                    self._warned_onesided = True
-                    log.info("maker: book already one-sided (up ask %s, down ask %s); "
-                             "waiting for a fair book before resting bids",
-                             _fmt(up_top), _fmt(down_top))
+                else:
+                    self._skip = f"book one-sided (up {_fmt(up_top)}, down {_fmt(down_top)})"
+                    if not self._warned_onesided:
+                        self._warned_onesided = True
+                        log.info("maker: book already one-sided (up ask %s, down ask %s); "
+                                 "waiting for a fair book before resting bids",
+                                 _fmt(up_top), _fmt(down_top))
 
         new: list[Fill] = []
         for side, order in list(self.orders.items()):
@@ -150,14 +161,31 @@ class MakerPair:
             self._naked_since = self._clock()
 
         if self.hedged or self.exited:
-            self._pull_overfill_bids("already hedged" if self.hedged else "already exited")
-        self._maybe_defensive_cancel(btc, open_price)
-        self._maybe_cancel(left)
+            new.extend(self._pull_overfill_bids("already hedged" if self.hedged else "already exited"))
+        new.extend(self._maybe_defensive_cancel(btc, open_price))
+        new.extend(self._maybe_cancel(left))
         return new
 
-    def close(self) -> None:
+    def close(self) -> list[Fill]:
         """Window is over: make sure nothing is left resting."""
-        self._cancel_all("window closed")
+        if not self.orders and not self.fills:
+            log.info("maker: never rested this window (%s)", self._skip or "no reason recorded")
+        return self._cancel_all("window closed")
+
+    def _defensive_limit(self, left: float, sigma: float | None) -> float:
+        """Toxic-move line in USD: fixed floor, widened by the realized tape.
+
+        A $20 move is a decision when BTC drifts $60 a window and noise when
+        it swings $300. Scale with the move still possible in the time left.
+        """
+        limit = self.cfg.maker_defensive_usd
+        if limit <= 0:
+            return limit
+        z = self.cfg.maker_defensive_z
+        if sigma is not None and sigma > 0 and z > 0:
+            frac = max(min(left, 300.0), 1.0) / 300.0
+            limit = max(limit, z * sigma * frac ** 0.5)
+        return limit
 
     @property
     def _keep_bid_left(self) -> float:
@@ -318,7 +346,7 @@ class MakerPair:
 
     def _maybe_defensive_cancel(
         self, btc: float | None, open_price: float | None,
-    ) -> None:
+    ) -> list[Fill]:
         """Pull bids that a BTC move is about to dump into.
 
         BTC up vs the witnessed open → Down is the dumped token. BTC down → Up.
@@ -326,11 +354,12 @@ class MakerPair:
         is a directional scrap, not a pair. If one side already filled, only
         pull the unfilled toxic bid so the leftover pair bid can still hit.
         """
+        found: list[Fill] = []
         if self.hedged or self.exited or self.cfg.maker_defensive_usd <= 0:
-            return
+            return found
         toxic = self._toxic_side(btc, open_price)
         if toxic is None:
-            return
+            return found
         delta = btc - open_price
         self._blocked.add(toxic)
         if not self.fills:
@@ -338,23 +367,29 @@ class MakerPair:
             if live:
                 log.info(
                     "maker: defensive cancel pair (BTC Δopen=%+.1f ≥ %.0f, nothing filled)",
-                    delta, self.cfg.maker_defensive_usd,
+                    delta, self._limit,
                 )
             for o in live:
-                self.executor.cancel_bid(o)
+                fill = self._cancel_one(o, "defensive pair")
+                if fill is not None:
+                    found.append(fill)
                 self._blocked.add(o.side)
-            self._stood_down = True
-            return
+            if not found:
+                self._stood_down = True
+            return found
         if self.shares(toxic) > 0.01:
-            return
+            return found
         order = self.orders.get(toxic)
         if order is None or order.done:
-            return
+            return found
         log.info(
             "maker: defensive cancel %s bid (BTC Δopen=%+.1f ≥ %.0f)",
-            toxic, delta, self.cfg.maker_defensive_usd,
+            toxic, delta, self._limit,
         )
-        self.executor.cancel_bid(order)
+        fill = self._cancel_one(order, "defensive toxic")
+        if fill is not None:
+            found.append(fill)
+        return found
 
     def _toxic_side(self, btc: float | None, open_price: float | None) -> str | None:
         if self.cfg.maker_defensive_usd <= 0 or btc is None or open_price is None:
@@ -362,7 +397,7 @@ class MakerPair:
         delta = btc - open_price
         # 15:10: waited at +25.3, posted at a one-tick dip, then yanked at +24.
         # Once decided, stay decided until BTC is clearly back (75% of threshold).
-        limit = self.cfg.maker_defensive_usd
+        limit = self._limit
         if self._feed_hold:
             limit = limit * 0.75
         if abs(delta) < limit:
@@ -371,19 +406,30 @@ class MakerPair:
         self._feed_hold = True
         return "down" if delta > 0 else "up"
 
-    def _pull_overfill_bids(self, why: str) -> None:
+    def _pull_overfill_bids(self, why: str) -> list[Fill]:
         """Cancel live bids that can only add a naked leg.
 
         Once we hedged (or a side is already fully filled), a resting bid on
         that side has no pair to complete -- it just doubles the position.
         """
+        found: list[Fill] = []
         wanted = self._wanted_shares()
         for side, order in list(self.orders.items()):
             if order.done:
                 continue
             if self.hedged or self.exited or self.shares(side) >= wanted - 0.01:
                 log.info("maker: pulling %s bid (%s)", side, why)
-                self.executor.cancel_bid(order)
+                fill = self._cancel_one(order, why)
+                if fill is not None:
+                    found.append(fill)
+        return found
+
+    def _cancel_one(self, order: RestingOrder, why: str) -> Fill | None:
+        fill = self.executor.cancel_bid(order)
+        if fill is not None:
+            self.fills.append(fill)
+            log.info("maker: harvested %s %.2f sh on cancel (%s)", fill.side, fill.size, why)
+        return fill
 
     # --------------------------------------------------------------- helpers
 
@@ -469,26 +515,31 @@ class MakerPair:
                 live_or_filled,
             )
 
-    def _maybe_cancel(self, left: float) -> None:
+    def _maybe_cancel(self, left: float) -> list[Fill]:
         if self.cancelled:
-            return
+            return []
         if self.fills:
             # Already in on one side: keep the other bid so it can still pair.
             if left <= self._keep_bid_left and self._live_orders():
-                self._cancel_all(f"T-{left:.0f}s leftover (pair still open)")
-            return
+                return self._cancel_all(f"T-{left:.0f}s leftover (pair still open)")
+            return []
         if self.orders and left <= self.cfg.maker_cancel_left_secs:
-            self._cancel_all(f"T-{left:.0f}s cutoff")
+            return self._cancel_all(f"T-{left:.0f}s cutoff")
+        return []
 
-    def _cancel_all(self, why: str) -> None:
+    def _cancel_all(self, why: str) -> list[Fill]:
         if self.cancelled:
-            return
+            return []
         self.cancelled = True
         live = [o for o in self.orders.values() if not o.done]
         if live:
             log.info("maker: cancelling %d resting bid(s) (%s)", len(live), why)
+        found: list[Fill] = []
         for o in live:
-            self.executor.cancel_bid(o)
+            fill = self._cancel_one(o, why)
+            if fill is not None:
+                found.append(fill)
+        return found
 
 
 def _fmt(top: BookTop | None) -> str:

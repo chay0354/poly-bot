@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -61,13 +62,19 @@ class BookReader:
     def __init__(self, clob_url: str, client: httpx.Client | None = None) -> None:
         self._url = clob_url.rstrip("/")
         self._client = client or httpx.Client(timeout=10)
+        self._last_warn = 0.0
 
     def top(self, token_id: str) -> BookTop:
         try:
             r = self._client.get(f"{self._url}/book", params={"token_id": token_id})
             r.raise_for_status()
             book = r.json()
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError) as e:
+            # An empty top looks exactly like a dead book, so say why (throttled).
+            now = time.monotonic()
+            if now - self._last_warn > 30:
+                self._last_warn = now
+                log.warning("book read failed (%s); strategies see an empty book", e)
             return BookTop(None, 0.0, None, 0.0)
         bids = book.get("bids") or []
         asks = book.get("asks") or []
@@ -238,12 +245,23 @@ class Executor:
                         paper=True, maker=True)
         return self._live.poll_bid(order)
 
-    def cancel_bid(self, order: RestingOrder) -> None:
-        if order.done:
-            return
-        order.done = True
+    def cancel_bid(self, order: RestingOrder) -> Fill | None:
+        """Cancel a rest. Always re-read live matches first — a bid can fill
+        in the same second we yank it (11:25 ET: Down hit, we logged 0 filled,
+        never recorded, never sold, lost $5).
+        """
         if order.paper:
+            if order.done:
+                return None
+            order.done = True
             log.info("[PAPER] cancel bid %s (%.2f/%.2f filled)",
                      order.side, order.filled, order.size)
-            return
-        self._live.cancel_bid(order)
+            return None
+        fill = self._live.poll_bid(order)
+        if not order.done:
+            self._live.cancel_bid(order)
+            extra = self._live.poll_bid(order)
+            order.done = True
+            if extra is not None:
+                fill = extra
+        return fill

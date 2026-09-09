@@ -177,7 +177,10 @@ class Bot:
                 if maker is not None:
                     tick = self.feed.latest
                     btc = tick.price if tick else None
-                    fills = maker.step(up_top, down_top, btc=btc, open_price=open_price)
+                    fills = maker.step(
+                        up_top, down_top, btc=btc, open_price=open_price,
+                        sigma=self.feed.realized_vol(300.0),
+                    )
                     for f in fills:
                         position.add(f)
                     if fills:
@@ -220,7 +223,14 @@ class Bot:
                 await asyncio.sleep(self.cfg.poll_interval_secs)
         finally:
             if maker is not None:
-                maker.close()  # never leave a bid resting into the next window
+                late = maker.close()  # never leave a bid resting into the next window
+                for f in late:
+                    position.add(f)
+                if late:
+                    self._record_fills(
+                        market, Signal("maker", [], "harvest on window close"),
+                        late, open_price,
+                    )
 
         self._settle_window(market, position, open_price, witnessed, path)
 

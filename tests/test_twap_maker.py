@@ -2,7 +2,7 @@
 
 import time
 
-from pm5.clob import BookTop, Executor, taker_fee_usdc
+from pm5.clob import BookTop, Executor, Fill, taker_fee_usdc
 from pm5.config import Config
 from pm5.maker import MakerPair
 from pm5.markets import Market, current_window_start, slug_for
@@ -389,6 +389,56 @@ def test_maker_does_not_post_when_feed_already_moved():
     # 15:10: Δ dipped under $20 for a tick — still hold, do not rest.
     mk.step(_book(0.52), _book(0.52), btc=50019.0, open_price=50000.0)
     assert mk.orders == {} and not mk.posted
+
+
+def test_maker_defensive_line_scales_with_realized_vol():
+    """9 Sep: BTC swung $300+/window; a fixed $20 line kept us out all hour."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_defensive_usd = 20
+    # Quiet tape: floor applies.
+    assert mk._defensive_limit(290.0, sigma=60.0) == 20
+    # Fast tape at the open: 0.15 × 300 ≈ 45.
+    assert abs(mk._defensive_limit(300.0, sigma=300.0) - 45.0) < 0.5
+    # Same tape near the close: less time for a reversal → tighter (~20).
+    assert abs(mk._defensive_limit(60.0, sigma=300.0) - 20.1) < 0.5
+    # Δ=+25 on a fast tape is noise: we post and keep both bids.
+    mk.step(_book(0.52), _book(0.52), btc=50025.0, open_price=50000.0, sigma=300.0)
+    assert mk.posted and set(mk.orders) == {"up", "down"}
+    mk.step(_book(0.52), _book(0.52), btc=50025.0, open_price=50000.0, sigma=300.0)
+    assert not mk.orders["down"].done and not mk.orders["up"].done
+    # +60 is a decision even on that tape.
+    mk.step(_book(0.52), _book(0.52), btc=50060.0, open_price=50000.0, sigma=300.0)
+    assert mk.orders["down"].done and mk.orders["up"].done
+
+
+def test_realized_vol_scales_to_horizon():
+    f = _feed_with([(0, 100.0), (50, 110.0), (100, 100.0), (150, 110.0), (200, 100.0)])
+    # 4 moves of 10 over 200s → rv=400 → scaled to 300s: sqrt(600)
+    assert abs(f.realized_vol(300) - 600 ** 0.5) < 1e-6
+    # Not enough history for the horizon → None.
+    assert f.realized_vol(1000) is None
+
+
+def test_maker_harvests_fill_that_hit_during_defensive_cancel():
+    """11:25 ET: Down filled as we yanked; local order still said 0/10.87."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_defensive_usd = 20
+    mk.step(_book(0.52), _book(0.52))
+    hidden = Fill("DOWN", "down", 0.46, 10.87, 5.0002, paper=True, maker=True)
+    real = ex.cancel_bid
+
+    def harvest(order):
+        if order.side == "down" and order.filled == 0:
+            order.filled = 10.87
+            order.done = True
+            return hidden
+        return real(order)
+
+    ex.cancel_bid = harvest
+    fills = mk.step(_book(0.52), _book(0.52), btc=50025.0, open_price=50000.0)
+    assert any(f.side == "down" and f.size > 10 for f in fills)
+    assert mk.shares("down") > 10
+    assert not mk._stood_down
 
 
 def test_maker_does_not_repost_after_defensive_yank():
