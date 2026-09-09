@@ -47,6 +47,7 @@ class MakerPair:
         self.hedged = False
         self.exited = False
         self._warned_onesided = False
+        self._warned_feed = False
         self._naked_since: float | None = None  # monotonic time we became one-sided
         self._blocked: set[str] = set()  # sides we will not re-post (defensive pull)
         self._clock = time.monotonic
@@ -102,8 +103,22 @@ class MakerPair:
             and m.seconds_in >= self.cfg.maker_start_secs
             and left > self._keep_bid_left
         ):
+            toxic = self._toxic_side(btc, open_price)
+            if toxic is not None:
+                self._blocked.add(toxic)
             already_in = bool(self.orders or self.fills)
-            if already_in and not self.posted:
+            if toxic is not None and not self.fills:
+                # Book can still look 0.50/0.50 after a $20 Chainlink move.
+                # Posting the pair then yanking one side leaves a naked rest
+                # (14:55: posted both, cancelled Down at Δ=+28, Up filled).
+                if not self._warned_feed:
+                    self._warned_feed = True
+                    log.info(
+                        "maker: BTC already Δopen=%+.1f; waiting for a quiet "
+                        "open before resting a pair",
+                        btc - open_price,
+                    )
+            elif already_in and not self.posted:
                 # One leg is on / filled: always retry the missing bid, even
                 # if the book has gone one-sided (that is how we get stuck naked).
                 self._post()
@@ -299,19 +314,31 @@ class MakerPair:
     def _maybe_defensive_cancel(
         self, btc: float | None, open_price: float | None,
     ) -> None:
-        """Pull the unfilled bid on the side a BTC move is about to dump.
+        """Pull bids that a BTC move is about to dump into.
 
         BTC up vs the witnessed open → Down is the dumped token. BTC down → Up.
-        Already-filled sides are left alone so the leftover bid can still pair.
+        If nothing has filled yet, cancel *both* rests — a leftover 0.46 bid
+        is a directional scrap, not a pair. If one side already filled, only
+        pull the unfilled toxic bid so the leftover pair bid can still hit.
         """
         if self.hedged or self.exited or self.cfg.maker_defensive_usd <= 0:
             return
-        if btc is None or open_price is None:
+        toxic = self._toxic_side(btc, open_price)
+        if toxic is None:
             return
         delta = btc - open_price
-        if abs(delta) < self.cfg.maker_defensive_usd:
+        self._blocked.add(toxic)
+        if not self.fills:
+            live = [o for o in self.orders.values() if not o.done]
+            if live:
+                log.info(
+                    "maker: defensive cancel pair (BTC Δopen=%+.1f ≥ %.0f, nothing filled)",
+                    delta, self.cfg.maker_defensive_usd,
+                )
+            for o in live:
+                self.executor.cancel_bid(o)
+                self._blocked.add(o.side)
             return
-        toxic = "down" if delta > 0 else "up"
         if self.shares(toxic) > 0.01:
             return
         order = self.orders.get(toxic)
@@ -322,7 +349,14 @@ class MakerPair:
             toxic, delta, self.cfg.maker_defensive_usd,
         )
         self.executor.cancel_bid(order)
-        self._blocked.add(toxic)
+
+    def _toxic_side(self, btc: float | None, open_price: float | None) -> str | None:
+        if self.cfg.maker_defensive_usd <= 0 or btc is None or open_price is None:
+            return None
+        delta = btc - open_price
+        if abs(delta) < self.cfg.maker_defensive_usd:
+            return None
+        return "down" if delta > 0 else "up"
 
     def _pull_overfill_bids(self, why: str) -> None:
         """Cancel live bids that can only add a naked leg.

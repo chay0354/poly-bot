@@ -370,14 +370,22 @@ def test_maker_defensive_cancel_pulls_dumped_side():
     # +10 is noise: both bids stay.
     mk.step(_book(0.52), _book(0.52), btc=50010.0, open_price=50000.0)
     assert not mk.orders["down"].done and not mk.orders["up"].done
-    # BTC dumped up: Down is about to be sold into us — pull only that bid.
+    # BTC dumped up, nothing filled: yank the whole pair, not a naked leftover.
     mk.step(_book(0.52), _book(0.52), btc=50025.0, open_price=50000.0)
-    assert mk.orders["down"].done and not mk.orders["up"].done
+    assert mk.orders["down"].done and mk.orders["up"].done
     assert "down" in mk._blocked
-    # Must not re-post the toxic side later in the window.
+    # Must not re-post while the feed is still decided.
     mk.posted = False
     mk.step(_book(0.52), _book(0.52), btc=50025.0, open_price=50000.0)
-    assert mk.orders["down"].done
+    assert mk.orders["down"].done and mk.orders["up"].done
+
+
+def test_maker_does_not_post_when_feed_already_moved():
+    """14:55: book still 0.50/0.50 but Chainlink already +$28 vs open."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_defensive_usd = 20
+    mk.step(_book(0.52), _book(0.52), btc=50028.0, open_price=50000.0)
+    assert mk.orders == {} and not mk.posted
 
 
 def test_maker_defensive_keeps_other_bid_after_fill():
