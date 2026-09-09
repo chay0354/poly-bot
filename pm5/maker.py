@@ -135,7 +135,8 @@ class MakerPair:
                 # if the book has gone one-sided (that is how we get stuck naked).
                 self._post(tops, relax=True)
             elif not self.posted and left <= self.cfg.maker_cancel_left_secs:
-                self._skip = f"joined too late (T-{left:.0f}s)"
+                if self._skip is None:
+                    self._skip = f"joined too late (T-{left:.0f}s)"
             elif not self.posted:
                 if self._book_undecided(tops):
                     self._post(tops)
