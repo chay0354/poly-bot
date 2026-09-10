@@ -35,6 +35,14 @@ from .pricefeed import Tick
 log = logging.getLogger("pm5.fastfeed")
 
 
+def geo_blocked(err: object) -> bool:
+    """Binance rejects US IPs with HTTP 451 (Unavailable For Legal Reasons).
+    Railway US-East is one of those IPs; retrying every 30s just floods the log.
+    Coinbase is the leading venue from Virginia anyway."""
+    t = str(err).lower()
+    return "451" in t or "restricted location" in t or "unavailable for legal" in t
+
+
 class TradeFeed:
     """One venue's trade tape kept as a rolling history. Subclasses parse."""
 
@@ -83,6 +91,13 @@ class TradeFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - reconnect on anything
+                if geo_blocked(e):
+                    log.warning(
+                        "fast feed %s geo-blocked (%s); standing this venue down, "
+                        "other leading feeds keep running",
+                        self.name, e,
+                    )
+                    return
                 log.warning("fast feed %s disconnected (%s); reconnecting in %.0fs",
                             self.name, e, backoff)
                 await asyncio.sleep(backoff)

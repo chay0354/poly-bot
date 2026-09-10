@@ -68,7 +68,9 @@ window (`_trade_window`) wires the pieces together:
  `TradeFeed`; `FastFeeds` answers `delta_since` / `realized_vol` from whichever
  venue printed most recently (first mover wins) and **never mixes venues in a
  delta** (BTCUSDT vs BTC-USD carry a basis). A venue that did not cover the
- open is skipped for that window's Δ. Settlement stays on Chainlink.
+ open is skipped for that window's Δ. Settlement stays on Chainlink. Binance
+ **HTTP 451** (US IP / Railway US-East) stands that venue down; Coinbase
+ keeps running.
 - **Execution** (`clob.py` → `live.py`) — `Executor.buy` simulates in paper mode or
  delegates to `LiveTrader` in live mode. `Executor.sell` walks the bid depth
  (`BookTop.sell_plan`) and the live order is a **FAK** down to that price — a

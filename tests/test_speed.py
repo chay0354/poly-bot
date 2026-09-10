@@ -15,7 +15,7 @@ from pm5.bot import Bot
 from pm5.clob import BookTop, Executor, RestingOrder
 from pm5.clobws import MarketStream, UserStream
 from pm5.config import Config
-from pm5.fastfeed import BinanceFeed, CoinbaseFeed, FastFeeds
+from pm5.fastfeed import BinanceFeed, CoinbaseFeed, FastFeeds, geo_blocked
 from pm5.maker import MakerPair
 from pm5.markets import Market, current_window_start, slug_for
 from pm5.live import parse_clob_usdc
@@ -53,6 +53,12 @@ def test_coinbase_ticker_parses_and_ignores_other_frames():
     assert f._subscribe_frame() == {
         "type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"],
     }
+
+
+def test_binance_451_is_a_geo_block_not_a_blip():
+    assert geo_blocked("server rejected WebSocket connection: HTTP 451")
+    assert geo_blocked("Restricted location")
+    assert not geo_blocked("connection reset")
 
 
 def test_binance_feed_still_parses_and_wakes():
