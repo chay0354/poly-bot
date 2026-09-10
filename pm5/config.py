@@ -51,6 +51,12 @@ class Config:
     fast_feed: bool = field(default_factory=lambda: _b("PM_FAST_FEED", True))
     fast_feed_url: str = field(default_factory=lambda: os.getenv(
         "PM_FAST_FEED_URL", "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"))
+    # CLOB WebSockets: order books (public) and our own order events (auth).
+    # Replaces per-tick HTTP polling so the loop can run at `fast_poll_secs`.
+    # Either falls back to HTTP silently when down.
+    ws_market: bool = field(default_factory=lambda: _b("PM_WS_MARKET", True))
+    ws_user: bool = field(default_factory=lambda: _b("PM_WS_USER", True))
+    fast_poll_secs: float = field(default_factory=lambda: _f("PM_FAST_POLL", 0.25))
 
     # --- Risk / sizing ---
     stake_usdc: float = field(default_factory=lambda: _f("PM_STAKE_USDC", 5.0))
@@ -66,11 +72,16 @@ class Config:
     # Simulated paper bankroll (USDC). The bot stops when it can no longer fund a
     # trade. 0 = unlimited (no bankroll stop). Paper mode only.
     paper_bankroll: float = field(default_factory=lambda: _f("PM_PAPER_BANKROLL", 100.0))
-    # Optional extra cap: stop after this much cumulative loss. 0 = disabled
-    # (the bankroll above is the primary stop).
+    # Stop for the rest of the UTC day once realized + settled P&L is this far
+    # negative. Live P&L is estimated per window (pairs lock $1, exits are
+    # realized, a held naked leg settles on the witnessed Chainlink outcome)
+    # and persisted to data/day_pnl.json so a restart cannot reset it.
+    # 0 = disabled.
     daily_loss_limit_usdc: float = field(
         default_factory=lambda: _f("PM_DAILY_LOSS_LIMIT", 0.0)
     )
+    # `{mode}` expands to live/paper so a paper session never spends the live budget.
+    day_pnl_file: str = field(default_factory=lambda: os.getenv("PM_DAY_PNL_FILE", "data/day_pnl_{mode}.json"))
 
     # --- Momentum strategy ---
     momentum_enabled: bool = field(default_factory=lambda: _b("PM_MOMENTUM", True))
@@ -105,6 +116,20 @@ class Config:
     # 0.04 let us rest at 0.42; both such fills (19:25, 19:31) were the worst
     # losses of the day — a 0.43 ask is a side already sliding.
     maker_bid_give: float = field(default_factory=lambda: _f("PM_MAKER_BID_GIVE", 0.02))
+    # Fair-value quoting. With Binance Δ since the open and the realized
+    # 5-min move we price each side: p_up = Φ(Δ / σ_remaining). Every bid is
+    # then rested at fair − EDGE (0.50 fair → 0.46, unchanged), pulled once
+    # fair − bid < PULL_EDGE (the fill would be adverse), and re-quoted when it
+    # drifts ≥ REQUOTE off target. Bids stay within BID ± SKEW_MAX, so the pair
+    # still costs ≤ 1 − 2·EDGE. A side whose target falls under the band is
+    # unquotable, and with nothing filled we quote neither (no lone leg).
+    # 10 Sep: 24 of 41 fills were a single 0.46 bid sitting stale while
+    # Binance had already moved; this is the fix for that.
+    maker_fair: bool = field(default_factory=lambda: _b("PM_MAKER_FAIR", True))
+    maker_edge: float = field(default_factory=lambda: _f("PM_MAKER_EDGE", 0.04))
+    maker_pull_edge: float = field(default_factory=lambda: _f("PM_MAKER_PULL_EDGE", 0.02))
+    maker_requote: float = field(default_factory=lambda: _f("PM_MAKER_REQUOTE", 0.02))
+    maker_skew_max: float = field(default_factory=lambda: _f("PM_MAKER_SKEW_MAX", 0.06))
     # Post the bids this many seconds after the window opens (let the book form).
     # 10s was too late on a fast tape: by then the book has tilted and BTC has
     # moved past the defensive line, so we never rested at all (9 Sep session).
@@ -139,6 +164,10 @@ class Config:
     maker_stop_ticks: float = field(default_factory=lambda: _f("PM_MAKER_STOP", 0.04))
     # Don't dump into a dust bid; hold if the best bid is below this.
     maker_exit_min_bid: float = field(default_factory=lambda: _f("PM_MAKER_EXIT_MIN_BID", 0.10))
+    # An exit may walk this far under the best bid to get the whole leg out.
+    # A thin top level used to block the sale entirely and the leg was then
+    # carried to a $0 resolution (two −$5 windows on 10 Sep).
+    maker_exit_slip: float = field(default_factory=lambda: _f("PM_MAKER_EXIT_SLIP", 0.03))
 
     # --- Fees ---
     # Polymarket crypto taker fee: shares × rate × p × (1-p). Makers pay 0.

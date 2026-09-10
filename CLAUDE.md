@@ -20,6 +20,10 @@ python -m venv .venv
 # Run (paper mode is the default — no credentials needed)
 .venv/bin/python run.py
 
+# Windows: creates .venv if missing, UTF-8 console, restarts on crash
+.\start.ps1          # mode per .env
+.\start.ps1 -Paper   # force paper
+
 # Tune behavior with env vars inline (see .env.example for all knobs)
 PM_MIN_DELTA_USD=3 PM_DECIDE_WITHIN=60 .venv/bin/python run.py
 
@@ -47,8 +51,19 @@ window (`_trade_window`) wires the pieces together:
 - **Signals** (`strategy.py`) — each poll, `_pick_signal` tries **arbitrage first**
   (risk-free), then momentum. Arbitrage uses the order book (`clob.py`); momentum
   uses the feed.
+- **Books + fills over WebSocket** (`clobws.py`) — `MarketStream` keeps live
+ order books for the tokens the bot `watch()`es (full `book` snapshot, then
+ `price_change` deltas); `BookReader.top` reads from it and only falls back to
+ HTTP `/book` when the stream is not healthy or has no snapshot. `UserStream`
+ (auth, live mode) carries our own order events so `LiveTrader.poll_bid` sees
+ fills in ms and only reconciles over HTTP every few seconds. With both books
+ off the socket the loop runs at `PM_FAST_POLL` (0.25s) instead of
+ `PM_POLL_INTERVAL`. The next window's books are subscribed ~20s early.
 - **Execution** (`clob.py` → `live.py`) — `Executor.buy` simulates in paper mode or
-  delegates to `LiveTrader` in live mode.
+ delegates to `LiveTrader` in live mode. `Executor.sell` walks the bid depth
+ (`BookTop.sell_plan`) and the live order is a **FAK** down to that price — a
+ thin top level must never block an exit (two $5 legs were carried to a $0
+ resolution on 10 Sep because of a "top size < shares" refusal).
 - **Settlement** — the market resolves on the **Chainlink 60s TWAP** at close vs.
  the open snapshot (rules changed Aug 2026), so paper positions settle against
  `feed.twap(end-60, end)`, and momentum decides on `feed.projected_close(...)`
@@ -58,12 +73,24 @@ window (`_trade_window`) wires the pieces together:
   sides early in the window; paper fills are simulated when the best ask crosses
   our bid. After one fill, wait for the leftover maker bid — do not taker-buy
   the other side while it is still live, and count the 7% taker fee in any
-  pair-complete cap. A Chainlink move of `PM_MAKER_DEFENSIVE_USD` vs the
-  witnessed open cancels the unfilled bid on the side about to be dumped. If a
-  naked leg cannot pair after `PM_MAKER_EXIT_SECS`, we sell it at the bid
-  instead of holding to resolution. `MakerPair.close()` must always run at
-  window end (it's in a `finally`) so no bid is left resting into the next
-  market.
+ pair-complete cap. **Fair-value quoting** (`maker.fair_up`, `PM_MAKER_FAIR`):
+ once the realized 5-min range is known, p_up = Φ(Binance Δ since open / σ of
+ the move still possible); each bid rests at fair − `PM_MAKER_EDGE`, is pulled
+ when fair − bid < `PM_MAKER_PULL_EDGE`, re-quoted when ≥ `PM_MAKER_REQUOTE`
+ off target, and stays inside bid ± `PM_MAKER_SKEW_MAX`. A side whose target
+ falls under the band is *unquotable*; with nothing filled we quote neither
+ (never a lone leg) and quote again when fair returns — no stand-down. Until σ
+ is known, the older fixed line (`PM_MAKER_DEFENSIVE_USD`, vol-scaled by
+ `PM_MAKER_DEFENSIVE_Z`) does the same job. If a naked leg cannot pair after
+ `PM_MAKER_EXIT_SECS` (or its bid is `PM_MAKER_STOP` under the fill) we sell it
+ rather than hold to resolution; the sell may walk `PM_MAKER_EXIT_SLIP` under
+ the top bid. `MakerPair.close()` must always run at window end (it's in a
+ `finally`) so no bid is left resting into the next market.
+- **Daily loss limit** (`ledger.py`, `PM_DAILY_LOSS_LIMIT`) — per-UTC-day P&L
+ persisted to `data/day_pnl_{mode}.json`. Live windows are *estimated*
+ (`supabase_log.estimated_pnl`: pairs pay $1, exits are realized, a held leg
+ settles on the witnessed outcome). When hit, the loop sleeps to the next UTC
+ day instead of exiting, because a supervisor would just restart it.
 - **Paper bankroll** — paper mode tracks a simulated balance (`PM_PAPER_BANKROLL`)
   on the `Executor`: debited on each fill, credited the payout on settlement. The
   run loop stops when it can't fund the next trade (`_bankroll_exhausted`).
@@ -86,6 +113,9 @@ window (`_trade_window`) wires the pieces together:
   where the feed was already streaming *before* the window opened
   (`feed.witnessed_open`). A bot started mid-window never saw the true open, so it
   runs **arbitrage-only** for that window. Arbitrage is book-based and always safe.
+ The maker gets `witnessed=` too: in an unwitnessed window it rests only once
+ Binance can give a Δ vs the open (a blind 0.46 rest at T+70s into a leaning
+ book is a guaranteed adverse fill).
 - **Arbitrage is all-or-none** (`_execute_arb`). It re-reads both books fresh and
   aborts unless every leg is still fillable — a half-filled arb is naked
   directional risk, the opposite of the intent.
@@ -98,9 +128,10 @@ window (`_trade_window`) wires the pieces together:
 
 ### Order book convention
 
-CLOB `/book` returns **bids ascending and asks descending**, so the best bid/ask
-are both the *last* element. `BookReader.top` already handles this — read from it,
-don't re-parse books elsewhere.
+CLOB `/book` (and the WS `book` event) return **bids ascending and asks
+descending**, so the best bid/ask are both the *last* element. `BookReader.top`
+normalizes both sources into a `BookTop` whose `bids`/`asks` are **best first** —
+read from it, don't re-parse books elsewhere.
 
 ## Config
 

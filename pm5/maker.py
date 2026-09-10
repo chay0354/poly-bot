@@ -24,6 +24,7 @@ edge is the pair discount plus the hedge. Paper it before trusting it.
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 from .clob import BookTop, Executor, Fill, RestingOrder, taker_fee_usdc
@@ -35,11 +36,35 @@ from .strategy import Leg, Signal
 log = logging.getLogger("pm5.maker")
 
 
+def fair_up(delta: float, range_5m: float, left: float) -> float:
+    """P(Up) from the move since the open and how fast the tape is moving.
+
+    Treat BTC as a random walk. The expected high−low of a walk over T is
+    ≈ 1.6·σ·√T, so the realized 5-min range gives σ_5m ≈ range / 1.6. The
+    market settles on the TWAP of the final 60s, whose centre sits ~30s
+    before the close, so the horizon is (left − 30). Then
+        p_up = Φ(Δ / (σ_5m · √(horizon / 300))).
+    Quiet tape ($60 range): a $10 move is p≈0.61 — decisive. Fast tape
+    ($300 range): the same $10 is p≈0.53 — noise. That is the difference a
+    fixed "$20 line" could never express.
+    """
+    horizon = max(left - 30.0, 5.0)
+    std = (range_5m / 1.6) * math.sqrt(horizon / 300.0)
+    if std <= 0:
+        return 0.5
+    return 0.5 * (1.0 + math.erf(delta / std / math.sqrt(2.0)))
+
+
 class MakerPair:
-    def __init__(self, cfg: Config, executor: Executor, market: Market) -> None:
+    def __init__(
+        self, cfg: Config, executor: Executor, market: Market, witnessed: bool = True,
+    ) -> None:
         self.cfg = cfg
         self.executor = executor
         self.market = market
+        # Did the Chainlink feed see this window's open? If not, we only rest
+        # once Binance can give a Δ vs the open (its history covers it).
+        self.witnessed = witnessed
         self.orders: dict[str, RestingOrder] = {}
         self.fills: list[Fill] = []
         self.posted = False
@@ -57,6 +82,11 @@ class MakerPair:
         self._fast_delta: float | None = None  # Binance move since open, if known
         self._delta_src = "chainlink"
         self._skip: str | None = None  # why we have not rested yet (for close())
+        self._fair_up: float | None = None  # model P(Up) this tick, if the tape is known
+        self._fair_hold: set[str] = set()  # sides currently unquotable (hysteresis)
+        self._warned_fair = False
+        self.requotes = 0  # cancel/replace count this window (churn gauge)
+        self._last_requote: dict[str, float] = {}
         self._clock = time.monotonic
 
     # ----------------------------------------------------------------- state
@@ -113,6 +143,7 @@ class MakerPair:
         tops = {"up": up_top, "down": down_top}
         self._limit = self._defensive_limit(left, sigma)
         self._fast_delta = fast_delta
+        self._fair_up = self._fair(btc, open_price, sigma, left)
 
         if (
             not self.hedged
@@ -124,19 +155,45 @@ class MakerPair:
             already_in = bool(self.fills or self._live_orders())
             if self._stood_down and not self.fills:
                 self._skip = "stood down after defensive yank"
+            elif (
+                not already_in and not self.witnessed
+                and self._delta(btc, open_price) is None
+            ):
+                # Bot started mid-window and neither feed can give a Δ vs the
+                # open: fair is unknown and the defensive line has nothing to
+                # compare. Resting blind here is how the first window after
+                # every restart got picked off (08:51: rested 0.46 at T+70s
+                # into a 0.65/0.36 book, hit in 4s, sold at 0.31).
+                self._skip = "open not witnessed — no Δ to price the pair"
+                if not self._warned_feed:
+                    self._warned_feed = True
+                    log.info("maker: %s; sitting this window out", self._skip)
             elif toxic is not None and not self.fills:
                 # Book can still look 0.50/0.50 after a $20 Chainlink move.
                 # Posting the pair then yanking one side leaves a naked rest
                 # (14:55: posted both, cancelled Down at Δ=+28, Up filled).
                 d = self._delta(btc, open_price) or 0.0
-                self._skip = f"BTC Δopen={d:+.1f} ≥ {self._limit:.0f} ({self._delta_src})"
-                if not self._warned_feed:
-                    self._warned_feed = True
-                    log.info(
-                        "maker: BTC already Δopen=%+.1f (line %.0f, %s); waiting for a "
-                        "quiet open before resting a pair",
-                        d, self._limit, self._delta_src,
+                if self._fair_up is not None:
+                    self._skip = (
+                        f"fair up {self._fair_up:.2f} leaves {toxic} unquotable "
+                        f"(Δopen={d:+.1f} {self._delta_src})"
                     )
+                    if not self._warned_fair:
+                        self._warned_fair = True
+                        log.info(
+                            "maker: fair up %.2f (Δopen=%+.1f, %s) — %s cannot be quoted "
+                            "≥ %.2f; waiting for a two-sided fair",
+                            self._fair_up, d, self._delta_src, toxic, self._fair_floor(),
+                        )
+                else:
+                    self._skip = f"BTC Δopen={d:+.1f} ≥ {self._limit:.0f} ({self._delta_src})"
+                    if not self._warned_feed:
+                        self._warned_feed = True
+                        log.info(
+                            "maker: BTC already Δopen=%+.1f (line %.0f, %s); waiting for a "
+                            "quiet open before resting a pair",
+                            d, self._limit, self._delta_src,
+                        )
             elif already_in and not self.posted:
                 # One leg is on / filled: retry the missing bid even if the
                 # book has gone one-sided (that is how we get stuck naked).
@@ -175,13 +232,115 @@ class MakerPair:
         if self.hedged or self.exited:
             new.extend(self._pull_overfill_bids("already hedged" if self.hedged else "already exited"))
         new.extend(self._maybe_defensive_cancel(btc, open_price))
+        new.extend(self._maybe_requote())
         new.extend(self._maybe_cancel(left))
         return new
+
+    # ------------------------------------------------------------ fair value
+
+    def _fair(self, btc, open_price, sigma: float | None, left: float) -> float | None:
+        if not self.cfg.maker_fair or sigma is None or sigma <= 0:
+            return None
+        delta = self._delta(btc, open_price)
+        if delta is None:
+            return None
+        return fair_up(delta, sigma, left)
+
+    def _fair_side(self, side: str) -> float:
+        assert self._fair_up is not None
+        return self._fair_up if side == "up" else 1.0 - self._fair_up
+
+    def _fair_floor(self) -> float:
+        return round(self.cfg.maker_bid - self.cfg.maker_skew_max, 2)
+
+    def _fair_target(self, side: str, relax: bool = False) -> float | None:
+        """Bid for `side` at fair − edge, on the tick grid, within the skew band.
+
+        None = unquotable (target under the band). `relax` (the other leg is
+        already filled) lets the complement go as low as the exit floor: a
+        cheap complement is a cheaper pair, not a lone leg.
+        """
+        tick = self.market.tick_size or 0.01
+        fair = self._fair_side(side)
+        px = math.floor((fair - self.cfg.maker_edge) / tick + 1e-9) * tick
+        px = round(min(px, self.cfg.maker_bid + self.cfg.maker_skew_max), 2)
+        lo = self.cfg.maker_exit_min_bid if relax else self._fair_floor()
+        if px < lo - 1e-9:
+            return None
+        return px
+
+    def _unquotable(self, side: str) -> bool:
+        """Fair-based toxic test with hysteresis: a side drops out when its
+        target falls under the band and comes back only once it clears the
+        band by a requote step (so a fair flickering at the edge does not
+        pull and re-post every tick)."""
+        fair = self._fair_side(side)
+        lo = self._fair_floor()
+        edge = self.cfg.maker_edge
+        if side in self._fair_hold:
+            if fair - edge >= lo + self.cfg.maker_requote - 1e-9:
+                self._fair_hold.discard(side)
+                return False
+            return True
+        if fair - edge < lo - 1e-9:
+            self._fair_hold.add(side)
+            return True
+        return False
+
+    def _maybe_requote(self) -> list[Fill]:
+        """Keep each resting bid honest against fair.
+
+        Pull when fair − bid < pull_edge: the only way that bid fills now is
+        someone dumping a side that is already worth less than we pay (every
+        one of the 24 naked exits on 10 Sep). Re-quote upward when the target
+        has moved ≥ requote above the bid: the fill chance is worth more than
+        the tick. Either way the side is re-posted next tick by `_post`.
+        """
+        found: list[Fill] = []
+        if self._fair_up is None or self.hedged or self.exited or self.cancelled:
+            return found
+        for side, order in list(self.orders.items()):
+            if order.done:
+                continue
+            fair = self._fair_side(side)
+            edge_now = fair - order.price
+            if edge_now < self.cfg.maker_pull_edge - 1e-9:
+                log.info("maker: pull %s bid %.2f — fair %.2f, edge %+.3f < %.2f (%s)",
+                         side, order.price, fair, edge_now, self.cfg.maker_pull_edge,
+                         self._delta_src)
+                fill = self._cancel_one(order, "fair moved against bid")
+                if fill is not None:
+                    found.append(fill)
+                self.requotes += 1
+                self.posted = False
+                continue
+            relax = bool(self.fills) and self.shares(side) < 0.01
+            target = self._fair_target(side, relax)
+            if (
+                target is not None
+                and target - order.price >= self.cfg.maker_requote - 1e-9
+                and self._clock() - self._last_requote.get(side, 0.0) >= self.REQUOTE_MIN_SECS
+            ):
+                log.info("maker: requote %s %.2f → %.2f (fair %.2f)", side, order.price, target, fair)
+                fill = self._cancel_one(order, "requote toward fair")
+                if fill is not None:
+                    found.append(fill)
+                self.requotes += 1
+                self._last_requote[side] = self._clock()
+                self.posted = False
+        return found
+
+    # Improving a bid is optional; at most one per side per second so a fair
+    # wobbling across the band does not turn into a cancel/post storm. Pulls
+    # (risk control) are never throttled.
+    REQUOTE_MIN_SECS = 1.0
 
     def close(self) -> list[Fill]:
         """Window is over: make sure nothing is left resting."""
         if not self.orders and not self.fills:
             log.info("maker: never rested this window (%s)", self._skip or "no reason recorded")
+        elif self.requotes:
+            log.info("maker: %d re-quotes this window", self.requotes)
         return self._cancel_all("window closed")
 
     def _defensive_limit(self, left: float, sigma: float | None) -> float:
@@ -363,6 +522,7 @@ class MakerPair:
                         f"{ask:.2f} + fee {fee:.3f} = {all_in:.3f}, beats selling @ {bid:.2f}"
                     ),
                 )
+        floor = round(max(bid - self.cfg.maker_exit_slip, self.cfg.maker_exit_min_bid), 2)
         return Signal(
             kind="maker-exit",
             legs=[Leg(
@@ -372,6 +532,7 @@ class MakerPair:
                 stake_usdc=round(qty * bid, 2),
                 top=top,
                 shares=qty,
+                min_price=floor,  # the sell may walk down to here
             )],
             reason=f"exit naked {side} {qty:.1f}sh @ bid {bid:.2f} ({why}, pair never closed)",
         )
@@ -386,9 +547,19 @@ class MakerPair:
         self._pull_overfill_bids("pair locked by taker buy")
 
     def mark_exited(self, fills: list[Fill]) -> None:
+        self.fills.extend(fills)
+        left = self.naked_shares if self.naked_side is not None else 0.0
+        if left >= max(self.market.min_size, 0.01):
+            # A FAK only found depth for part of the leg. Stay armed so
+            # exit_signal fires again for the rest next tick.
+            log.warning("maker: partial exit, still naked %s %.2f sh — retrying",
+                        self.naked_side, left)
+            return
+        if left >= 0.01:
+            log.warning("maker: %.2f sh of %s left under the %.0f-share minimum; rides to resolution",
+                        left, self.naked_side, self.market.min_size)
         self.exited = True
         self.hedged = True
-        self.fills.extend(fills)
         log.info("maker exited: %s", self.summary())
         self._pull_overfill_bids("sold naked leg")
 
@@ -410,6 +581,24 @@ class MakerPair:
             return found
         delta = self._delta(btc, open_price) or 0.0
         src = self._delta_src
+        if self._fair_up is not None:
+            # Fair-value mode. A resting bid on a side we hold is handled by
+            # `_maybe_requote` (pull / re-price). With nothing filled, an
+            # unquotable side means no pair is possible: pull both, but do
+            # not block or stand down — when fair comes back we quote again.
+            if self.fills:
+                return found
+            live = self._live_orders()
+            if not live:
+                return found
+            log.info("maker: pull pair — fair up %.2f leaves %s unquotable (Δopen=%+.1f, %s)",
+                     self._fair_up, toxic, delta, src)
+            for o in live:
+                fill = self._cancel_one(o, "pair unquotable at fair")
+                if fill is not None:
+                    found.append(fill)
+            self.posted = False
+            return found
         if not self.fills:
             live = [o for o in self.orders.values() if not o.done]
             if not live:
@@ -465,6 +654,11 @@ class MakerPair:
     def _toxic_side(self, btc: float | None, open_price: float | None) -> str | None:
         if self.cfg.maker_defensive_usd <= 0:
             return None
+        if self._fair_up is not None:
+            for side in ("up", "down"):
+                if self._unquotable(side):
+                    return side
+            return None
         delta = self._delta(btc, open_price)
         if delta is None:
             return None
@@ -516,8 +710,14 @@ class MakerPair:
         the point where the other side has become cheap.
         """
         tick = self.market.tick_size or 0.01
-        lo = self._bid_floor() + tick           # post-only must not cross
-        hi = 1.0 - self.cfg.maker_bid + 0.08    # e.g. 0.62 for a 0.46 bid
+        if self._fair_up is not None:
+            # Fair decides what is quotable; the book only has to leave room
+            # for a post-only bid inside the skew band on both sides.
+            lo = self._fair_floor() + tick
+            hi = 1.0 - self._fair_floor() + 0.08
+        else:
+            lo = self._bid_floor() + tick           # post-only must not cross
+            hi = 1.0 - self.cfg.maker_bid + 0.08    # e.g. 0.62 for a 0.46 bid
         for side in ("up", "down"):
             top = tops.get(side)
             if top is None or top.best_ask is None:
@@ -532,19 +732,28 @@ class MakerPair:
     def _bid_for(
         self, side: str, tops: dict[str, BookTop | None], relax: bool = False,
     ) -> float | None:
-        """Price to rest on `side`: our bid, or one tick under a lower ask.
+        """Price to rest on `side`.
 
-        None if even the floor would cross (that side has already collapsed).
-        `relax` drops the floor: when the other leg is already on, a cheap
-        complement is a cheaper pair, not a collapsed side to avoid.
+        With fair known: fair − edge inside the skew band (0.40–0.52 for a
+        0.46 bid). Without: our fixed bid. Either way one tick under a lower
+        ask so post-only never crosses, and None if the result is under the
+        floor (that side has collapsed). `relax` drops the floor: when the
+        other leg is already on, a cheap complement is a cheaper pair, not a
+        collapsed side to avoid.
         """
-        px = self.cfg.maker_bid
         tick = self.market.tick_size or 0.01
+        if self._fair_up is not None:
+            px = self._fair_target(side, relax)
+            if px is None:
+                return None
+            floor = self.cfg.maker_exit_min_bid if relax else self._fair_floor()
+        else:
+            px = self.cfg.maker_bid
+            floor = self.cfg.maker_exit_min_bid if relax else self._bid_floor()
         top = tops.get(side)
         if top is not None and top.best_ask is not None and top.best_ask <= px:
             px = round(top.best_ask - tick, 2)
-        floor = self.cfg.maker_exit_min_bid if relax else self._bid_floor()
-        if px < floor:
+        if px < floor - 1e-9:
             return None
         return px
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -19,6 +20,36 @@ class BookTop:
     best_bid_size: float
     best_ask: float | None
     best_ask_size: float
+    # Full depth, best first, when the source had it (WS book or REST). The
+    # sell path walks `bids` so a thin top level never blocks an exit.
+    bids: list[tuple[float, float]] = field(default_factory=list)
+    asks: list[tuple[float, float]] = field(default_factory=list)
+    source: str = "http"
+
+    def sell_plan(self, shares: float, floor: float) -> tuple[float, float] | None:
+        """(worst price, fillable shares) for selling `shares` into bids ≥ floor.
+
+        Walks depth when known; otherwise only the top level is visible and
+        we assume it can absorb the order (a FAK then fills what it can).
+        """
+        levels = self.bids or (
+            [(self.best_bid, self.best_bid_size or shares)] if self.best_bid is not None else []
+        )
+        got = 0.0
+        worst: float | None = None
+        for price, size in levels:
+            if price < floor - 1e-9:
+                break
+            take = min(size, shares - got)
+            if take <= 0:
+                break
+            got += take
+            worst = price
+            if got >= shares - 1e-9:
+                break
+        if worst is None or got <= 0:
+            return None
+        return worst, round(min(got, shares), 2)
 
 
 @dataclass
@@ -57,14 +88,25 @@ def taker_fee_usdc(shares: float, price: float, rate: float) -> float:
 
 
 class BookReader:
-    """Reads CLOB order books over plain HTTP (no auth needed)."""
+    """Reads CLOB order books: from the market WebSocket when it has a fresh
+    snapshot, else over plain HTTP (no auth needed)."""
 
-    def __init__(self, clob_url: str, client: httpx.Client | None = None) -> None:
+    def __init__(self, clob_url: str, client: httpx.Client | None = None,
+                 stream=None) -> None:
         self._url = clob_url.rstrip("/")
         self._client = client or httpx.Client(timeout=10)
         self._last_warn = 0.0
+        self.stream = stream  # MarketStream | None
+        self.http_reads = 0
+        self.ws_reads = 0
 
     def top(self, token_id: str) -> BookTop:
+        if self.stream is not None:
+            book = self.stream.book(token_id)
+            if book is not None:
+                self.ws_reads += 1
+                return _top_from_levels(book.bid_levels(), book.ask_levels(), "ws")
+        self.http_reads += 1
         try:
             r = self._client.get(f"{self._url}/book", params={"token_id": token_id})
             r.raise_for_status()
@@ -76,14 +118,25 @@ class BookReader:
                 self._last_warn = now
                 log.warning("book read failed (%s); strategies see an empty book", e)
             return BookTop(None, 0.0, None, 0.0)
-        bids = book.get("bids") or []
-        asks = book.get("asks") or []
         # API returns bids ascending (best=last) and asks descending (best=last).
-        best_bid = float(bids[-1]["price"]) if bids else None
-        best_bid_size = float(bids[-1]["size"]) if bids else 0.0
-        best_ask = float(asks[-1]["price"]) if asks else None
-        best_ask_size = float(asks[-1]["size"]) if asks else 0.0
-        return BookTop(best_bid, best_bid_size, best_ask, best_ask_size)
+        bids = [(float(l["price"]), float(l["size"])) for l in (book.get("bids") or [])]
+        asks = [(float(l["price"]), float(l["size"])) for l in (book.get("asks") or [])]
+        bids.sort(reverse=True)
+        asks.sort()
+        return _top_from_levels(bids, asks, "http")
+
+
+def _top_from_levels(bids: list[tuple[float, float]], asks: list[tuple[float, float]],
+                     source: str) -> BookTop:
+    return BookTop(
+        best_bid=bids[0][0] if bids else None,
+        best_bid_size=bids[0][1] if bids else 0.0,
+        best_ask=asks[0][0] if asks else None,
+        best_ask_size=asks[0][1] if asks else 0.0,
+        bids=bids,
+        asks=asks,
+        source=source,
+    )
 
 
 class Executor:
@@ -152,7 +205,12 @@ class Executor:
                      f"{self.bankroll:.2f}" if self.bankroll is not None else "∞")
             return Fill(token_id, side, price, net_shares, cost, paper=True)
 
-        return self._live.buy(token_id, side, price, shares)
+        return self._live.buy(token_id, side, price, shares, min_price=min_price)
+
+    @property
+    def user_stream(self):
+        """Authenticated order-event stream (live mode only), for the bot to run."""
+        return getattr(self._live, "user_stream", None)
 
     def sell(
         self,
@@ -162,7 +220,13 @@ class Executor:
         min_price: float,
         top: BookTop | None = None,
     ) -> Fill | None:
-        """Marketable sell of `shares` at the best bid, if bid >= `min_price`.
+        """Marketable sell of `shares` into the bids at or above `min_price`.
+
+        Walks the book depth: a thin top level used to block the whole exit
+        ("bid size 3 < 10.87") and two $5 legs were then held to a $0
+        resolution (21:10 and 01:15 UTC, 10 Sep). Now the order is a
+        fill-and-kill at the worst price the depth reaches, and if the depth
+        above the floor cannot absorb everything we still sell what it can.
 
         Fill.size is negative and Fill.cost is negative proceeds so Position
         and paper settlement net the exit correctly.
@@ -178,14 +242,26 @@ class Executor:
         if top.best_bid < min_price:
             self.last_skip = f"bid {top.best_bid:.2f} < floor {min_price:.2f}"
             return None
-        if top.best_bid_size > 0 and top.best_bid_size + 1e-9 < shares:
-            self.last_skip = f"bid size {top.best_bid_size:.2f} < {shares:.2f}"
+        plan = top.sell_plan(shares, min_price)
+        if plan is None:
+            self.last_skip = f"no depth ≥ {min_price:.2f}"
             return None
+        worst, qty = plan
+        # Never round up: selling 10.88 when we hold 10.87 is a hard reject.
+        qty = math.floor(qty * 100 + 1e-9) / 100
+        if qty <= 0:
+            self.last_skip = "depth too thin"
+            return None
+        partial = qty + 1e-9 < shares
+        if partial:
+            log.warning("sell %s: depth ≥ %.2f only covers %.2f of %.2f sh; selling what it can",
+                        side, min_price, qty, shares)
 
         self.last_skip = None
-        price = top.best_bid
-        qty = round(shares, 2)
         if self._live is None:
+            # Paper: assume the walk fills at each level; book the worst price
+            # for the whole lot to stay conservative.
+            price = worst
             proceeds = round(qty * price, 4)
             fee = taker_fee_usdc(qty, price, self.cfg.taker_fee_rate)
             net = round(proceeds - fee, 4)
@@ -199,7 +275,7 @@ class Executor:
             )
             return Fill(token_id, side, price, -qty, cost, paper=True)
 
-        return self._live.sell(token_id, side, price, qty)
+        return self._live.sell(token_id, side, worst, qty)
 
     # ------------------------------------------------------------------ maker
 
@@ -214,11 +290,14 @@ class Executor:
             return RestingOrder(token_id, side, price, shares, paper=True)
         return self._live.place_bid(token_id, side, price, shares, tick_size, neg_risk)
 
-    def poll_bid(self, order: RestingOrder, top: BookTop | None = None) -> Fill | None:
+    def poll_bid(self, order: RestingOrder, top: BookTop | None = None,
+                 force: bool = False) -> Fill | None:
         """Check a resting bid for new fills; returns a Fill for the new shares.
 
         Paper: we can't see the tape, so a bid counts as hit only when the best
         ask has come down to (or through) our price -- a conservative proxy.
+        Live: answered from the user WebSocket when it is healthy; `force`
+        insists on an HTTP read (used around cancels).
         """
         if order.done:
             return None
@@ -243,12 +322,15 @@ class Executor:
                      order.side, qty, order.price, cost)
             return Fill(order.token_id, order.side, order.price, qty, cost,
                         paper=True, maker=True)
-        return self._live.poll_bid(order)
+        return self._live.poll_bid(order, force=force)
 
     def cancel_bid(self, order: RestingOrder) -> Fill | None:
         """Cancel a rest. Always re-read live matches first — a bid can fill
         in the same second we yank it (11:25 ET: Down hit, we logged 0 filled,
-        never recorded, never sold, lost $5).
+        never recorded, never sold, lost $5). The pre-cancel read may come from
+        the user stream (ms-fresh); the post-cancel read is always HTTP, since
+        the stream may not have delivered the final event yet and that read is
+        the one that decides whether a fill exists.
         """
         if order.paper:
             if order.done:
@@ -260,7 +342,7 @@ class Executor:
         fill = self._live.poll_bid(order)
         if not order.done:
             self._live.cancel_bid(order)
-            extra = self._live.poll_bid(order)
+            extra = self._live.poll_bid(order, force=True)
             order.done = True
             if extra is not None:
                 fill = extra

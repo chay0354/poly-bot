@@ -75,8 +75,9 @@ def _install_patch() -> None:
 GAMMA_HOST = "gamma-api.polymarket.com"
 CLOB_HOST = "clob.polymarket.com"
 WS_LIVE_HOST = "ws-live-data.polymarket.com"
+WS_CLOB_HOST = "ws-subscriptions-clob.polymarket.com"
 
 
 def bootstrap() -> None:
     """Resolve every Polymarket host the bot needs, up front."""
-    ensure_resolvable(GAMMA_HOST, CLOB_HOST, WS_LIVE_HOST)
+    ensure_resolvable(GAMMA_HOST, CLOB_HOST, WS_LIVE_HOST, WS_CLOB_HOST)

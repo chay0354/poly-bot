@@ -91,3 +91,23 @@ class BinanceFeed:
         if ref is None:
             return None
         return self.latest.price - ref
+
+    def realized_vol(self, secs: float) -> float | None:
+        """High−low over the last `secs` (USD), same definition as the
+        Chainlink feed's. Binance trades every ~100ms, so this is usable
+        within a couple of minutes of connecting and it is the tape the
+        fair-value model should be calibrated on (the makers hitting us
+        trade off it). None until half the horizon is covered."""
+        if not self.fresh or len(self._history) < 2:
+            return None
+        cutoff = self.latest.src_ts - secs
+        hi = lo = None
+        for t in self._history:
+            if t.src_ts < cutoff:
+                continue
+            hi = t.price if hi is None else max(hi, t.price)
+            lo = t.price if lo is None else min(lo, t.price)
+        covered = self.latest.src_ts - max(cutoff, self._history[0].src_ts)
+        if hi is None or covered < secs * 0.5:
+            return None
+        return hi - lo

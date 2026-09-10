@@ -8,6 +8,7 @@ import time
 from pm5.bot import Bot, Position
 from pm5.clob import BookTop, Fill
 from pm5.config import Config
+from pm5.ledger import DayLedger
 from pm5.status import LiveStatus
 from pm5.markets import Market, current_window_start, slug_for
 from pm5.pricefeed import ChainlinkFeed, Tick
@@ -360,7 +361,7 @@ def test_settlement_records_window(tmp_path):
     bot = Bot.__new__(Bot)
     bot.cfg = cfg
     bot.session_pnl = 0.0
-    bot.day_pnl = 0.0
+    bot.ledger = DayLedger(None)
     bot.executor = type("E", (), {"bankroll": None})()
     bot.recorder = Recorder(str(tmp_path / "trades.jsonl"), enabled=True, mode="paper")
 
@@ -482,7 +483,7 @@ def test_bankroll_credited_on_settlement():
     bot = Bot.__new__(Bot)
     bot.cfg = cfg
     bot.session_pnl = 0.0
-    bot.day_pnl = 0.0
+    bot.ledger = DayLedger(None)
     bot.recorder = type("R", (), {"enabled": False})()
     bot.executor = Executor(cfg, reader=None)
     bot.feed = type("F", (), {"latest": Tick(price=101.0, src_ts=0, recv_ts=0),
@@ -510,6 +511,7 @@ def test_bankroll_exhausted_stop_condition():
     cfg.paper_bankroll = 100.0
     cfg.momentum_enabled = True
     cfg.arb_enabled = False
+    cfg.maker_enabled = False
     cfg.stake_usdc = 5.0
     bot = Bot.__new__(Bot)
     bot.cfg = cfg

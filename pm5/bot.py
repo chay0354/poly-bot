@@ -20,14 +20,17 @@ import httpx
 
 from . import net
 from .clob import BookReader, Executor, Fill
+from .clobws import MarketStream
 from .config import Config
 from .fastfeed import BinanceFeed
+from .ledger import DayLedger
 from .maker import MakerPair
-from .markets import Market, MarketDiscovery, current_window_start
+from .markets import WINDOW_SECS, Market, MarketDiscovery, current_window_start
 from .pricefeed import ChainlinkFeed
 from .recorder import Recorder
 from .status import LiveStatus
 from .strategy import ArbitrageStrategy, MomentumStrategy, Signal
+from .supabase_log import estimated_pnl
 
 log = logging.getLogger("pm5.bot")
 
@@ -61,7 +64,8 @@ class Bot:
         net.bootstrap()
         self._http = httpx.Client(timeout=15)
         self.discovery = MarketDiscovery(cfg.gamma_url, self._http)
-        self.reader = BookReader(cfg.clob_url, self._http)
+        self.market_stream = MarketStream() if cfg.ws_market and cfg.mode != "signal" else None
+        self.reader = BookReader(cfg.clob_url, self._http, stream=self.market_stream)
         self.executor = Executor(cfg, self.reader)
         self.feed = ChainlinkFeed(cfg.ws_live_url, net.WS_LIVE_HOST)
         self.fast = BinanceFeed(cfg.fast_feed_url) if cfg.fast_feed else None
@@ -69,17 +73,30 @@ class Bot:
         self.arb = ArbitrageStrategy(cfg, self.reader)
         self.recorder = Recorder(cfg.data_file, enabled=cfg.record, mode=cfg.mode)
         self.session_pnl = 0.0
-        self.day_pnl = 0.0
+        # Realized/settled P&L for the UTC day, persisted across restarts.
+        # Only tracked where money is real or simulated (not signal mode).
+        self.ledger = DayLedger(
+            cfg.day_pnl_file.format(mode=cfg.mode) if cfg.mode != "signal" else None
+        )
+
+    @property
+    def day_pnl(self) -> float:
+        return self.ledger.today()
 
     async def run(self) -> None:
-        feed_task = asyncio.create_task(self.feed.run())
-        fast_task = asyncio.create_task(self.fast.run()) if self.fast is not None else None
+        tasks = [asyncio.create_task(self.feed.run())]
+        if self.fast is not None:
+            tasks.append(asyncio.create_task(self.fast.run()))
+        if self.market_stream is not None:
+            tasks.append(asyncio.create_task(self.market_stream.run()))
+        user_stream = self.executor.user_stream
+        if user_stream is not None:
+            tasks.append(asyncio.create_task(user_stream.run()))
         ok = await self.feed.wait_connected(timeout=20)
         if not ok:
             log.error("price feed did not connect; aborting")
-            feed_task.cancel()
-            if fast_task is not None:
-                fast_task.cancel()
+            for t in tasks:
+                t.cancel()
             return
         bank = self.executor.bankroll
         if self.cfg.mode == "signal":
@@ -104,17 +121,35 @@ class Bot:
                     log.error("paper bankroll exhausted ($%.2f left); stopping",
                               self.executor.bankroll)
                     break
-                if self.cfg.daily_loss_limit_usdc > 0 and (
-                    self.day_pnl <= -self.cfg.daily_loss_limit_usdc
-                ):
-                    log.error("daily loss limit hit (%.2f); stopping", self.day_pnl)
-                    break
+                if self._loss_limit_hit():
+                    # Sleep to the next UTC day rather than exit: a supervisor
+                    # (Railway, start.ps1) would just restart us into the same
+                    # losing day.
+                    await self._sleep_until_next_utc_day()
+                    continue
                 await self._trade_window()
         finally:
-            feed_task.cancel()
-            if fast_task is not None:
-                fast_task.cancel()
+            for t in tasks:
+                t.cancel()
             self.recorder.close()
+
+    def _loss_limit_hit(self) -> bool:
+        limit = self.cfg.daily_loss_limit_usdc
+        if limit <= 0:
+            return False
+        pnl = self.day_pnl
+        if pnl > -limit:
+            return False
+        log.error("DAILY LOSS LIMIT: %+.2f today ≤ −%.2f; no more trades until the next UTC day",
+                  pnl, limit)
+        return True
+
+    async def _sleep_until_next_utc_day(self) -> None:
+        now = time.time()
+        next_day = (int(now) // 86400 + 1) * 86400
+        wait = max(60.0, min(next_day - now + 5, 3600.0))
+        log.info("sleeping %.0f min (loss limit)", wait / 60)
+        await asyncio.sleep(wait)
 
     def _min_trade_cost(self) -> float:
         """Smallest amount needed to place any enabled strategy's next trade."""
@@ -142,20 +177,29 @@ class Bot:
         witnessed = self.feed.witnessed_open(market.window_start)
         note = "" if witnessed else " (open not witnessed — arb only)"
         log.info("── window %s | %s%s", market.slug, market.question, note)
+        if self.market_stream is not None:
+            self.market_stream.watch([market.up_token, market.down_token])
         position = Position()
         trades = 0
         open_price: float | None = None
         path: list[dict] = []  # price/quote snapshots over the decision zone
+        last_path_t: int | None = None
+        next_market: Market | None = None
+        next_try_at = 0.0
         self._window_logged = set()  # dedup repetitive attempt logs within a window
         maker = (
-            MakerPair(self.cfg, self.executor, market)
+            MakerPair(self.cfg, self.executor, market, witnessed=witnessed)
             if self.cfg.maker_enabled and self.cfg.mode != "signal" else None
         )
+        ticks = 0
+        ws_reads0, http_reads0 = self.reader.ws_reads, self.reader.http_reads
+        t_loop0 = time.monotonic()
 
         try:
             while market.seconds_left > 0:
                 if current_window_start() != ws:
                     break  # rolled into the next window
+                ticks += 1
 
                 if witnessed and open_price is None:
                     open_price = self.feed.price_at_or_after(market.window_start)
@@ -165,6 +209,7 @@ class Bot:
                 secs_left = market.seconds_left
                 sampling = (
                     self.cfg.record and self.cfg.path_secs > 0 and secs_left <= self.cfg.path_secs
+                    and int(secs_left) != last_path_t
                 )
                 # Read both books at most once per tick, shared by arb / maker /
                 # status / path.
@@ -174,6 +219,7 @@ class Bot:
                     down_top = self.reader.top(market.down_token)
 
                 if sampling:
+                    last_path_t = int(secs_left)
                     tick = self.feed.latest
                     path.append({
                         "t": round(secs_left, 1),
@@ -182,6 +228,20 @@ class Bot:
                         "dn": down_top.best_ask if down_top else None,
                     })
 
+                # Subscribe the next window's books before it opens so the
+                # first quote of the window is not waiting on a snapshot.
+                if (
+                    self.market_stream is not None and next_market is None
+                    and secs_left <= 20 and time.monotonic() >= next_try_at
+                ):
+                    next_try_at = time.monotonic() + 5.0
+                    next_market = self.discovery.fetch(ws + WINDOW_SECS)
+                    if next_market is not None:
+                        self.market_stream.watch([
+                            market.up_token, market.down_token,
+                            next_market.up_token, next_market.down_token,
+                        ])
+
                 if maker is not None:
                     tick = self.feed.latest
                     btc = tick.price if tick else None
@@ -189,9 +249,12 @@ class Bot:
                         self.fast.delta_since(market.window_start)
                         if self.fast is not None else None
                     )
+                    sigma = self.fast.realized_vol(300.0) if self.fast is not None else None
+                    if sigma is None:
+                        sigma = self.feed.realized_vol(300.0)
                     fills = maker.step(
                         up_top, down_top, btc=btc, open_price=open_price,
-                        sigma=self.feed.realized_vol(300.0), fast_delta=fast_delta,
+                        sigma=sigma, fast_delta=fast_delta,
                     )
                     for f in fills:
                         position.add(f)
@@ -232,7 +295,7 @@ class Bot:
                             self._record_fills(market, signal, fills, open_price)
 
                 self._render_status(market, open_price, up_top, down_top, position)
-                await asyncio.sleep(self.cfg.poll_interval_secs)
+                await asyncio.sleep(self._tick_secs(up_top, down_top))
         finally:
             if maker is not None:
                 late = maker.close()  # never leave a bid resting into the next window
@@ -243,8 +306,24 @@ class Bot:
                         market, Signal("maker", [], "harvest on window close"),
                         late, open_price,
                     )
+            elapsed = max(time.monotonic() - t_loop0, 1e-6)
+            log.info(
+                "loop: %d ticks in %.0fs (%.2fs/tick) | books %d ws / %d http",
+                ticks, elapsed, elapsed / max(ticks, 1),
+                self.reader.ws_reads - ws_reads0, self.reader.http_reads - http_reads0,
+            )
 
         self._settle_window(market, position, open_price, witnessed, path)
+
+    def _tick_secs(self, up_top, down_top) -> float:
+        """Loop cadence: fast while both books come off the WebSocket (a tick
+        is then pure computation), the HTTP interval otherwise."""
+        if (
+            up_top is not None and down_top is not None
+            and up_top.source == "ws" and down_top.source == "ws"
+        ):
+            return self.cfg.fast_poll_secs
+        return self.cfg.poll_interval_secs
 
     def _pick_signal(
         self, market: Market, allow_momentum: bool, up_top, down_top
@@ -345,8 +424,9 @@ class Bot:
                 shares = leg.stake_usdc / leg.max_price if leg.max_price else 0.0
             # Never round up: selling 10.88 when we hold 10.87 is a hard reject.
             shares = math.floor(shares * 100 + 1e-9) / 100
+            floor = leg.min_price if leg.min_price > 0 else leg.max_price
             fill = self.executor.sell(
-                leg.token_id, leg.side, shares, min_price=leg.max_price, top=leg.top,
+                leg.token_id, leg.side, shares, min_price=floor, top=leg.top,
             )
             if fill is not None:
                 fills.append(fill)
@@ -480,8 +560,23 @@ class Bot:
         if not position.fills:
             log.info("no trades this window")
         elif is_live:
-            # Live fills settle on-chain at resolution; just report exposure.
-            log.info("live fills placed this window: cost=$%.2f (settles on-chain)", position.cost)
+            # Live fills settle on-chain. Estimate the window for the daily
+            # loss limit: pairs pay $1, exits are realized, a held naked leg
+            # settles on the witnessed outcome. Unknown outcome counts as 0.
+            up_sh = sum(f.size for f in position.fills if f.side == "up")
+            dn_sh = sum(f.size for f in position.fills if f.side == "down")
+            est = estimated_pnl(None, up_won, up_sh, dn_sh, position.cost)
+            if est is None:
+                log.info("live fills this window: cost=$%.2f, outcome unknown (open not witnessed)",
+                         position.cost)
+                est = 0.0
+            else:
+                self.session_pnl += est
+            day = self.ledger.add(est)
+            log.info("live window est. PnL=%+.2f | session=%+.2f | today=%+.2f%s",
+                     est, self.session_pnl, day,
+                     f" (limit −{self.cfg.daily_loss_limit_usdc:.2f})"
+                     if self.cfg.daily_loss_limit_usdc > 0 else "")
         elif up_won is None:
             # Should not happen (momentum is gated on `witnessed`), but never
             # fabricate a settlement we can't compute. Refund the paper stake so
@@ -492,7 +587,7 @@ class Bot:
         else:
             window_pnl = position.settle(up_won)
             self.session_pnl += window_pnl
-            self.day_pnl += window_pnl
+            self.ledger.add(window_pnl)
             # Return the payout (winning shares * $1 = cost + pnl) to the bankroll.
             self._credit_bankroll(position.cost + window_pnl)
             prefix = "if you entered, " if self.cfg.mode == "signal" else ""
