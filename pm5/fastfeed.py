@@ -38,6 +38,11 @@ class BinanceFeed:
             try:
                 async with websockets.connect(self._url, ping_interval=20) as ws:
                     backoff = 1.0
+                    if self.latest is not None and time.time() - self.latest.recv_ts > self.GAP_SECS:
+                        # A long gap means the history no longer covers the
+                        # tape: a window open inside the gap must read as
+                        # unknown, not as the first tick after reconnect.
+                        self._history.clear()
                     log.info("fast feed connected (binance)")
                     async for raw in ws:
                         self._ingest(raw)
@@ -75,7 +80,18 @@ class BinanceFeed:
     def fresh(self) -> bool:
         return self.latest is not None and time.time() - self.latest.recv_ts <= self._stale_secs
 
+    # Binance prints every ~100ms; a first tick more than this after `ts`
+    # means we were not listening at `ts`.
+    GAP_SECS = 3.0
+
+    def covers(self, ts: float) -> bool:
+        """True if the history was already streaming at `ts` (so a price read
+        at `ts` is the tape, not the moment we connected)."""
+        return bool(self._history) and self._history[0].src_ts <= ts + self.GAP_SECS
+
     def price_at_or_after(self, ts: float) -> float | None:
+        if not self.covers(ts):
+            return None
         for t in self._history:
             if t.src_ts >= ts:
                 return t.price
@@ -83,7 +99,9 @@ class BinanceFeed:
 
     def delta_since(self, ts: float) -> float | None:
         """Binance move since `ts` (window open), or None if we cannot know
-        it honestly: no trade at/after `ts` in history, or the stream is stale.
+        it honestly: we were not streaming at `ts`, no trade at/after `ts` in
+        history, or the stream is stale. Connecting at T+143s and calling the
+        first tick "the open" is how the 08:57 window nearly got a blind pair.
         """
         if not self.fresh:
             return None

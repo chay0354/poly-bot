@@ -430,6 +430,10 @@ def test_fast_feed_parses_binance_and_reports_delta_since_open():
     assert f.delta_since(time.time() - 5) == 30.5
     # No trade at/after the open we were asked about -> honest None.
     assert f.delta_since(time.time() + 60) is None
+    # We connected well after that open: the first tick we hold is not the
+    # open, so the move since it is unknown (not "since we connected").
+    assert not f.covers(time.time() - 60)
+    assert f.delta_since(time.time() - 60) is None
     f.latest = Tick(78831.0, time.time() - 30, time.time() - 30)
     assert not f.fresh and f.delta_since(time.time() - 60) is None
 
