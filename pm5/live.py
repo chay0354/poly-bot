@@ -19,11 +19,29 @@ from py_clob_client_v2 import (
     PartialCreateOrderOptions,
     Side,
 )
+from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
 from .clob import Fill, RestingOrder
 from .config import Config
 
 log = logging.getLogger("pm5.live")
+
+_BAL_RE = re.compile(r"balance:\s*(\d+)")
+_ACTIVE_RE = re.compile(r"sum of active orders:\s*(\d+)")
+
+
+def parse_clob_usdc(text: str) -> tuple[float | None, float | None]:
+    """(total, locked-in-bids) USDC from a CLOB collateral reject.
+
+    Site Cash can be higher: this is what the exchange will spend, and
+    open bids already reserve part of it. 11:05: Cash $12, CLOB $3.63
+    with $2.25 locked — the second bid needed $2.20 free and had $1.38.
+    """
+    m = _BAL_RE.search(text)
+    a = _ACTIVE_RE.search(text)
+    total = int(m.group(1)) / 1e6 if m else None
+    locked = int(a.group(1)) / 1e6 if a else None
+    return total, locked
 
 
 def _num(v) -> float | None:
@@ -58,6 +76,12 @@ class LiveTrader:
 
             self.user_stream = UserStream(creds.api_key, creds.api_secret, creds.api_passphrase)
         self._last_http_poll: dict[str, float] = {}
+        # True when a bid was refused because another of our bids already
+        # reserved the cash — not because the wallet is empty. The maker
+        # must pull the lone leg instead of pausing for a minute.
+        self.funds_tight = False
+        self._last_sell_try: dict[str, float] = {}
+        self._refreshed_at = 0.0
         # Off-thread CLOB calls (place / cancel / pre-sign). httpx.Client is
         # thread-safe; the CLOB client holds no per-call state.
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="clob")
@@ -77,25 +101,80 @@ class LiveTrader:
                 log.info("[LIVE] cancelled leftover open orders on start: %s", n)
             except Exception as e:  # noqa: BLE001
                 log.warning("[LIVE] cancel-all on start failed: %s", e)
+        self.sync_collateral()
 
     LOW_BALANCE_PAUSE = 60.0
+    SELL_RETRY_SECS = 0.25
+    COLLATERAL_CACHE_SECS = 5.0
     # With the user stream healthy, still confirm each resting order over
     # HTTP this often (the stream does not replay what a hiccup dropped).
     RECONCILE_SECS = 5.0
     # Without the stream, one HTTP status read per order per this many secs.
     HTTP_POLL_SECS = 1.0
 
+    def sync_collateral(self) -> tuple[float | None, float | None]:
+        """Ask the CLOB to refresh USDC allowance and return (balance, allowance).
+
+        Polymarket's site Cash is the wallet. The CLOB spends *allowance*,
+        which goes stale after deposits / redeems until this call. That is
+        how Cash $12.08 and a $3.63 reject showed up in the same minute.
+        """
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        try:
+            self.client.update_balance_allowance(params)
+            raw = self.client.get_balance_allowance(params)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[LIVE] collateral sync failed: %s", e)
+            return None, None
+        self._refreshed_at = time.monotonic()
+        if not isinstance(raw, dict):
+            return None, None
+        bal = _num(raw.get("balance"))
+        allo = _num(raw.get("allowance"))
+        if bal is not None and bal > 1000:
+            bal = bal / 1e6
+        if allo is not None and allo > 1000:
+            allo = allo / 1e6
+        if bal is not None or allo is not None:
+            log.info(
+                "[LIVE] CLOB USDC balance=$%s allowance=$%s (site Cash can be higher until synced)",
+                f"{bal:.2f}" if bal is not None else "?",
+                f"{allo:.2f}" if allo is not None else "?",
+            )
+        return bal, allo
+
     def _note_reject(self, e: Exception, want_usdc: float) -> None:
         text = str(e)
         if "not enough balance" not in text:
             return
-        m = re.search(r"balance:\s*(\d+)", text)
-        have = int(m.group(1)) / 1e6 if m else None
+        # A sell of shares looks like this too, but has no "active orders".
+        # Pausing the USDC path then would lock the maker out of a pair.
+        if "sum of active orders" not in text:
+            return
+        total, locked = parse_clob_usdc(text)
+        free = None
+        if total is not None:
+            free = total - (locked or 0.0)
+        # One refresh: a deposit / redeem often sits in site Cash until the
+        # CLOB allowance catches up.
+        if time.monotonic() - self._refreshed_at > 2.0:
+            self.sync_collateral()
+        if locked and locked > 0.05 and free is not None and free < want_usdc:
+            # Cash is reserved by our own bids, not missing from the wallet.
+            self.funds_tight = True
+            log.warning(
+                "[LIVE] CLOB USDC $%.2f ($%.2f locked in our bids), free $%.2f < $%.2f — "
+                "pulling the lone leg, not standing down",
+                total, locked, free, want_usdc,
+            )
+            return
         self._low_balance_until = time.monotonic() + self.LOW_BALANCE_PAUSE
         log.warning(
-            "[LIVE] wallet too low to rest a bid: have $%s, need $%.2f. Deposit USDC or "
-            "claim resolved winnings; pausing orders for %.0fs",
-            f"{have:.2f}" if have is not None else "?", want_usdc, self.LOW_BALANCE_PAUSE,
+            "[LIVE] CLOB USDC too low to rest a bid: total $%s free $%s need $%.2f "
+            "(site Cash is a different number). Pausing new bids %.0fs",
+            f"{total:.2f}" if total is not None else "?",
+            f"{free:.2f}" if free is not None else "?",
+            want_usdc, self.LOW_BALANCE_PAUSE,
         )
 
     def _paused(self) -> bool:
@@ -155,6 +234,14 @@ class LiveTrader:
         amount = round(shares, 2)
         if amount <= 0:
             return None
+        # A fill is visible to us before the CLOB credits the shares
+        # (11:40: sell 5 Up got balance:0 three times, then FAK-empty, then
+        # filled). Do not hammer every 26ms tick.
+        now = time.monotonic()
+        last = self._last_sell_try.get(token_id, 0.0)
+        if now - last < self.SELL_RETRY_SECS:
+            return None
+        self._last_sell_try[token_id] = now
         args = MarketOrderArgs(
             token_id=token_id,
             amount=amount,

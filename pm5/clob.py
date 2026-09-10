@@ -365,6 +365,16 @@ class Executor:
         if self._live is not None:
             self._live.forget_presigned(token_ids)
 
+    @property
+    def funds_tight(self) -> bool:
+        """Live: a bid was refused because our other bid already reserved
+        the USDC. Paper never hits this."""
+        return bool(getattr(self._live, "funds_tight", False))
+
+    def clear_funds_tight(self) -> None:
+        if self._live is not None:
+            self._live.funds_tight = False
+
     def set_wake(self, cb) -> None:
         """Thread-safe callable invoked when a background CLOB call finishes."""
         if self._live is not None:

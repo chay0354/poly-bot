@@ -9,3 +9,6 @@ dockerfilePath = "Dockerfile"
 startCommand = "python -u run.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+# Region is set in the dashboard (Settings → Deploy → Regions), not here.
+# Use US East Metal (us-east4-eqdc4a): Polymarket's CLOB is on the east coast.
+# Stop any local live copy first — two bots will both place orders.

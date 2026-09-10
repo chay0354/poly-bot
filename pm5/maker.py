@@ -242,6 +242,7 @@ class MakerPair:
 
         if self.hedged or self.exited:
             new.extend(self._pull_overfill_bids("already hedged" if self.hedged else "already exited"))
+        new.extend(self._maybe_pull_unfunded())
         new.extend(self._maybe_defensive_cancel(btc, open_price))
         new.extend(self._maybe_requote())
         new.extend(self._maybe_cancel(left))
@@ -731,6 +732,28 @@ class MakerPair:
             return None
         self._feed_hold = True
         return "down" if delta > 0 else "up"
+
+    def _maybe_pull_unfunded(self) -> list[Fill]:
+        """One leg on the book, the other refused because that bid already
+        reserved the cash: pull the lone leg. A rest we cannot pair is
+        directional risk (11:05: $3.63 free after a $2.25 lock, Down sat
+        alone while Up kept getting rejected)."""
+        if self.fills or not self.executor.funds_tight:
+            return []
+        live = self._live_orders()
+        if len(live) != 1:
+            if not live:
+                self.executor.clear_funds_tight()
+            return []
+        log.warning("maker: pulling lone %s bid — the other leg cannot be funded", live[0].side)
+        found: list[Fill] = []
+        fill = self._cancel_one(live[0], "pair unfunded")
+        if fill is not None:
+            found.append(fill)
+        self.posted = False
+        self._skip = "CLOB USDC locked; cannot fund a pair"
+        self.executor.clear_funds_tight()
+        return found
 
     def _pull_overfill_bids(self, why: str) -> list[Fill]:
         """Cancel live bids that can only add a naked leg.

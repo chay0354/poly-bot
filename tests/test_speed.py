@@ -7,6 +7,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from pm5.config import Config
 from pm5.fastfeed import BinanceFeed, CoinbaseFeed, FastFeeds
 from pm5.maker import MakerPair
 from pm5.markets import Market, current_window_start, slug_for
+from pm5.live import parse_clob_usdc
 from pm5.pricefeed import ChainlinkFeed
 
 
@@ -448,3 +450,40 @@ def test_maker_reposts_after_a_failed_placement():
     mk.step(_book(0.52), _book(0.52), sigma=150.0, fast_delta=0.0)
     mk.step(_book(0.52), _book(0.52), sigma=150.0, fast_delta=0.0)
     assert mk.orders["up"] is not first and mk.orders["up"].live
+
+
+def test_parse_clob_usdc_splits_total_from_locked_bids():
+    # 11:05 live: site Cash $12, CLOB total $3.63 with $2.25 already reserved.
+    text = (
+        "not enough balance / allowance: the balance is not enough -> "
+        "balance: 3626057, sum of active orders: 2250000, "
+        "sum of matched orders: 0, order amount (inc. fees): 2200000"
+    )
+    total, locked = parse_clob_usdc(text)
+    assert total == pytest.approx(3.626057)
+    assert locked == pytest.approx(2.25)
+    assert (total - locked) == pytest.approx(1.376057)
+
+
+def test_maker_pulls_the_lone_leg_when_the_other_cannot_be_funded():
+    """11:05: one bid reserved the cash, the other was refused, the lone
+    rest sat on the book. Pull it — a pair we cannot fund is directional."""
+    cfg = Config()
+    cfg.mode = "paper"
+    cfg.paper_bankroll = 0.0
+    cfg.maker_enabled = True
+    cfg.maker_bid = 0.46
+    cfg.maker_stake_usdc = 2.0
+    cfg.maker_start_secs = 3
+    cfg.maker_cancel_left_secs = 75
+    cfg.maker_fair = True
+    ex = Executor(cfg, reader=None)
+    mk = MakerPair(cfg, ex, _mk())
+    mk.step(_book(0.52), _book(0.52), sigma=150.0, fast_delta=0.0)
+    assert len(mk._live_orders()) == 2
+    mk.orders["up"].done = True
+    ex._live = SimpleNamespace(funds_tight=True)
+    mk.step(_book(0.52), _book(0.52), sigma=150.0, fast_delta=0.0)
+    assert mk._live_orders() == [] and not mk.fills
+    assert "locked" in (mk._skip or "")
+    assert ex._live.funds_tight is False
