@@ -10,5 +10,6 @@ startCommand = "python -u run.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 # Region is set in the dashboard (Settings → Deploy → Regions), not here.
-# Use US East Metal (us-east4-eqdc4a): Polymarket's CLOB is on the east coast.
-# Stop any local live copy first — two bots will both place orders.
+# Do NOT use US East: Polymarket rejects US IPs (403 geoblock). Their
+# primary CLOB is eu-west-2; closest allowed Railway region is EU West
+# (Netherlands — API is open). Stop any local live copy first.

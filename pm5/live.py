@@ -80,6 +80,7 @@ class LiveTrader:
         # reserved the cash — not because the wallet is empty. The maker
         # must pull the lone leg instead of pausing for a minute.
         self.funds_tight = False
+        self.geoblocked = False
         self._last_sell_try: dict[str, float] = {}
         self._refreshed_at = 0.0
         # Off-thread CLOB calls (place / cancel / pre-sign). httpx.Client is
@@ -91,6 +92,7 @@ class LiveTrader:
         # call finishes (set by the bot).
         self.wake = None
         log.info("live trader ready (sig_type=%s funder=%s)", cfg.signature_type, bool(cfg.funder_address))
+        self._check_geoblock()
         if cfg.cancel_on_start:
             # A previous copy that was killed hard (restart, deploy, crash)
             # may have left bids resting — nobody is watching those. Start
@@ -178,7 +180,47 @@ class LiveTrader:
         )
 
     def _paused(self) -> bool:
-        return time.monotonic() < self._low_balance_until
+        return getattr(self, "geoblocked", False) or time.monotonic() < self._low_balance_until
+
+    def _check_geoblock(self) -> None:
+        """Log where the CLOB sees us. US IPs cannot open orders (Railway
+        US-East). Polymarket's own docs: primary servers eu-west-2, closest
+        allowed region eu-west-1 — Railway EU West, not Virginia."""
+        try:
+            import httpx
+
+            r = httpx.get("https://polymarket.com/api/geoblock", timeout=10.0)
+            data = r.json() if r.is_success else {}
+        except Exception as e:  # noqa: BLE001
+            log.warning("[LIVE] geoblock check failed: %s", e)
+            return
+        if not isinstance(data, dict):
+            return
+        country = str(data.get("country") or "?").upper()
+        region = data.get("region") or "?"
+        blocked = data.get("blocked")
+        log.info("[LIVE] geoblock: country=%s region=%s site_blocked=%s", country, region, blocked)
+        if country in {"US", "UM"}:
+            self.geoblocked = True
+            log.error(
+                "[LIVE] this host is in the United States — the CLOB will 403 every order. "
+                "Move Railway to EU West (Netherlands). Do not stay on US East."
+            )
+
+    def _note_geoblock(self, e: Exception) -> bool:
+        text = str(e)
+        if "403" not in text and "restricted in your region" not in text.lower():
+            return False
+        if "restricted in your region" not in text.lower() and "geoblock" not in text.lower():
+            return False
+        if not self.geoblocked:
+            self.geoblocked = True
+            log.error(
+                "[LIVE] CLOB geoblock (403): trading is not allowed from this IP. "
+                "Move the host out of a restricted region (US East is one). "
+                "https://docs.polymarket.com/developers/CLOB/geoblock"
+            )
+        return True
 
     def buy(self, token_id: str, side: str, price: float, shares: float,
             min_price: float = 0.0) -> Fill | None:
@@ -205,6 +247,8 @@ class LiveTrader:
                 order_type=OrderType.FOK,
             )
         except Exception as e:  # noqa: BLE001
+            if self._note_geoblock(e):
+                return None
             if "not enough balance" in str(e):
                 self._note_reject(e, amount)
             else:
@@ -255,7 +299,8 @@ class LiveTrader:
                 order_type=OrderType.FAK,
             )
         except Exception as e:  # noqa: BLE001
-            log.error("[LIVE] sell failed for %s: %s", side, e)
+            if not self._note_geoblock(e):
+                log.error("[LIVE] sell failed for %s: %s", side, e)
             return None
 
         if not isinstance(resp, dict):
@@ -407,7 +452,9 @@ class LiveTrader:
         try:
             resp = fut.result()
         except Exception as e:  # noqa: BLE001
-            if "not enough balance" in str(e):
+            if self._note_geoblock(e):
+                pass
+            elif "not enough balance" in str(e):
                 self._note_reject(e, order.size * order.price)
             else:
                 log.error("[LIVE] rest bid failed for %s @ %.2f: %s", order.side, order.price, e)
