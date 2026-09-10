@@ -12,8 +12,13 @@ the status line keeps redrawing underneath.
 from __future__ import annotations
 
 import sys
+import time
 
 _ERASE_LINE = "\r\033[K"  # carriage return + clear to end of line
+
+# The trading loop iterates on every feed print (tens of times a second);
+# the console does not need to, and a Windows console write blocks the loop.
+MIN_REDRAW_SECS = 0.2
 
 # ANSI colors (only used when enabled, i.e. on a TTY).
 _GREEN = "\033[32m"
@@ -27,13 +32,18 @@ class LiveStatus:
         self._stream = stream or sys.stdout
         self.enabled = bool(enabled) and self._stream.isatty()
         self._active = False  # is a status line currently drawn?
+        self._last_draw = 0.0
 
     def render(self, text: str) -> None:
         if not self.enabled:
             return
+        now = time.monotonic()
+        if self._active and now - self._last_draw < MIN_REDRAW_SECS:
+            return
         self._stream.write(_ERASE_LINE + text)
         self._stream.flush()
         self._active = True
+        self._last_draw = now
 
     def clear(self) -> None:
         """Erase the status line so a log record can print cleanly."""
