@@ -87,6 +87,7 @@ class MakerPair:
         self._warned_fair = False
         self.requotes = 0  # cancel/replace count this window (churn gauge)
         self._last_requote: dict[str, float] = {}
+        self._tops: dict[str, BookTop | None] = {}
         self._clock = time.monotonic
 
     # ----------------------------------------------------------------- state
@@ -141,6 +142,7 @@ class MakerPair:
         m = self.market
         left = m.seconds_left
         tops = {"up": up_top, "down": down_top}
+        self._tops = tops
         self._limit = self._defensive_limit(left, sigma)
         self._fast_delta = fast_delta
         self._fair_up = self._fair(btc, open_price, sigma, left)
@@ -247,8 +249,31 @@ class MakerPair:
         return fair_up(delta, sigma, left)
 
     def _fair_side(self, side: str) -> float:
+        """P(side wins): the tape model, capped by what the book itself says.
+
+        The book's asks bound the probability without our own bids polluting
+        it: 1 − ask_other ≤ p ≤ ask_side. When the model reads 0.50 while
+        the book asks 0.41 for Up, the book knows something the Δ does not
+        (Chainlink's open print lags Binance; the makers price that in).
+        Standing in front of it is how 09:05 filled at 0.40 and sold at
+        0.36. The more pessimistic of the two wins on each side.
+        """
         assert self._fair_up is not None
-        return self._fair_up if side == "up" else 1.0 - self._fair_up
+        model = self._fair_up if side == "up" else 1.0 - self._fair_up
+        book = self._book_prob(side)
+        return model if book is None else min(model, book)
+
+    def _book_prob(self, side: str) -> float | None:
+        tops = self._tops
+        mine = tops.get(side)
+        other = tops.get("down" if side == "up" else "up")
+        a_s = mine.best_ask if mine is not None else None
+        a_o = other.best_ask if other is not None else None
+        if a_s is not None and a_o is not None:
+            return (a_s + (1.0 - a_o)) / 2.0
+        if a_s is not None:
+            return a_s
+        return None
 
     def _fair_floor(self) -> float:
         return round(self.cfg.maker_bid - self.cfg.maker_skew_max, 2)
@@ -315,7 +340,10 @@ class MakerPair:
                 self.posted = False
                 continue
             relax = bool(self.fills) and self.shares(side) < 0.01
-            target = self._fair_target(side, relax)
+            # Compare against the price we could actually post (stepped under
+            # a lower ask), not the raw target: 09:05 cancelled a 0.40 bid 15
+            # times "toward 0.46" and re-posted 0.40 under a 0.41 ask each time.
+            target = self._bid_for(side, self._tops, relax)
             if (
                 target is not None
                 and target - order.price >= self.cfg.maker_requote - 1e-9

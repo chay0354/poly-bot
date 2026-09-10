@@ -133,6 +133,45 @@ def test_maker_unquotable_side_pulls_pair_without_standing_down():
     assert len(mk._live_orders()) == 2
 
 
+def test_maker_trusts_a_leaning_book_over_a_flat_model():
+    """09:05 live: Δ≈0 so the model said 0.50/0.50 while the book asked 0.41
+    for Up. We bid 0.40 under it, got hit, sold at 0.36. The book's asks bound
+    p (1 − ask_other ≤ p ≤ ask_side); the more pessimistic estimate wins."""
+    cfg, ex, m, mk = _maker()
+    mk.step(_book(0.41), _book(0.60), sigma=150.0, fast_delta=0.0)
+    assert mk._live_orders() == [] and not mk.fills
+    assert "unquotable" in (mk._skip or "")
+    assert abs(mk._fair_side("up") - 0.405) < 1e-9   # (0.41 + 0.40) / 2
+    # A balanced book leaves the model alone.
+    cfg, ex, m, mk = _maker()
+    mk.step(_book(0.52), _book(0.52), sigma=150.0, fast_delta=0.0)
+    assert abs(mk._fair_side("up") - 0.5) < 1e-9
+    assert len(mk._live_orders()) == 2
+    # Book leans against a resting side (asks 0.47 / 0.55 → p_up 0.46, no edge
+    # left on the 0.46 bid) → that bid is pulled before anyone hits it.
+    mk.step(_book(0.47), _book(0.55), sigma=150.0, fast_delta=0.0)
+    assert mk.orders["up"].done and not mk.fills
+
+
+def test_maker_does_not_thrash_requotes_under_a_low_ask():
+    """09:05 live: target 0.46, ask 0.41 → posted 0.40, then 'requote 0.40 →
+    0.46' cancelled and re-posted 0.40 fifteen times. The requote test must
+    use the price we can actually post."""
+    cfg, ex, m, mk = _maker()
+    now = {"t": 1000.0}
+    mk._clock = lambda: now["t"]
+    # Wide but balanced book: asks 0.45 / 0.57 → book p_up = (0.45+0.43)/2 = 0.44,
+    # fair up 0.44 → target 0.40, stepped under the 0.45 ask stays 0.40.
+    mk.step(_book(0.45), _book(0.57), sigma=150.0, fast_delta=0.0)
+    up = mk.orders["up"]
+    assert not up.done and up.price == 0.40
+    for _ in range(5):
+        now["t"] += 1.5
+        mk.step(_book(0.45), _book(0.57), sigma=150.0, fast_delta=0.0)
+    assert mk.orders["up"] is up and not up.done
+    assert mk.requotes == 0
+
+
 def test_maker_falls_back_to_dollar_line_without_sigma():
     cfg, ex, m, mk = _maker()
     cfg.maker_defensive_usd = 20
