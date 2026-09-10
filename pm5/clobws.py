@@ -108,6 +108,9 @@ class _Stream:
         self._last_msg = 0.0
         self._reconnect = asyncio.Event()
         self._wake = asyncio.Event()  # set when there is something to subscribe
+        # Called after each event that changed state (same thread) so the
+        # trading loop can wake on it instead of on its next poll.
+        self.on_event = None
 
     @property
     def connected(self) -> bool:
@@ -196,12 +199,15 @@ class _Stream:
             msg = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return
+        changed = False
         if isinstance(msg, list):
             for m in msg:
                 if isinstance(m, dict):
-                    self._on_message(m)
+                    changed = bool(self._on_message(m)) or changed
         elif isinstance(msg, dict):
-            self._on_message(msg)
+            changed = bool(self._on_message(msg))
+        if changed and self.on_event is not None:
+            self.on_event()
 
 
 class MarketStream(_Stream):
@@ -254,15 +260,17 @@ class MarketStream(_Stream):
         for b in self._books.values():
             b.ready = False
 
-    def _on_message(self, msg: dict) -> None:
+    def _on_message(self, msg: dict) -> bool:
         et = msg.get("event_type")
         if et == "book":
             token = str(msg.get("asset_id") or "")
             book = self._books.get(token)
             if book is None:
-                return
+                return False
             book.replace(msg.get("bids"), msg.get("asks"))
-        elif et == "price_change":
+            return True
+        if et == "price_change":
+            changed = False
             for ch in msg.get("price_changes") or []:
                 if not isinstance(ch, dict):
                     continue
@@ -275,6 +283,9 @@ class MarketStream(_Stream):
                 if p is None or s is None or not side:
                     continue
                 book.apply(side, round(p, 4), s)
+                changed = True
+            return changed
+        return False
 
     def book(self, token_id: str) -> LocalBook | None:
         """The live book for `token_id`, or None if we cannot vouch for it."""
@@ -304,12 +315,12 @@ class UserStream(_Stream):
     def _subscribe_frames(self) -> list[dict]:
         return [{"auth": self._auth, "type": "user"}]
 
-    def _on_message(self, msg: dict) -> None:
+    def _on_message(self, msg: dict) -> bool:
         if msg.get("event_type") != "order":
-            return
+            return False
         oid = str(msg.get("id") or "")
         if not oid:
-            return
+            return False
         matched = _f(msg.get("size_matched"))
         prev = self.orders.get(oid)
         # Events can arrive out of order; matched never decreases.
@@ -325,6 +336,7 @@ class UserStream(_Stream):
             oldest = sorted(self.orders.items(), key=lambda kv: kv[1]["ts"])[:250]
             for k, _ in oldest:
                 self.orders.pop(k, None)
+        return True
 
     def state(self, order_id: str | None) -> dict | None:
         if not order_id or not self.healthy:

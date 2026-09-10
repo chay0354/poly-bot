@@ -51,12 +51,27 @@ class Config:
     fast_feed: bool = field(default_factory=lambda: _b("PM_FAST_FEED", True))
     fast_feed_url: str = field(default_factory=lambda: os.getenv(
         "PM_FAST_FEED_URL", "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"))
+    # Coinbase BTC-USD as a second leading venue (US-East: its ticks arrive
+    # ~80ms before Binance's from Tokyo). The most recent print wins.
+    coinbase_feed: bool = field(default_factory=lambda: _b("PM_COINBASE_FEED", True))
+    coinbase_feed_url: str = field(default_factory=lambda: os.getenv(
+        "PM_COINBASE_FEED_URL", "wss://ws-feed.exchange.coinbase.com"))
     # CLOB WebSockets: order books (public) and our own order events (auth).
     # Replaces per-tick HTTP polling so the loop can run at `fast_poll_secs`.
     # Either falls back to HTTP silently when down.
     ws_market: bool = field(default_factory=lambda: _b("PM_WS_MARKET", True))
     ws_user: bool = field(default_factory=lambda: _b("PM_WS_USER", True))
     fast_poll_secs: float = field(default_factory=lambda: _f("PM_FAST_POLL", 0.25))
+    # The loop is event-driven: any feed tick, book change or order event
+    # wakes it at once; `fast_poll_secs` is only the idle timeout. Wakes are
+    # coalesced so a burst of prints runs one iteration, not ten.
+    min_tick_secs: float = field(default_factory=lambda: _f("PM_MIN_TICK", 0.02))
+    # Sign the next window's likely bids ahead of time (live) so posting is
+    # a bare HTTP send instead of sign + send.
+    presign: bool = field(default_factory=lambda: _b("PM_PRESIGN", True))
+    # Live: cancel every open order of ours when the bot starts, so a copy
+    # that was killed with bids resting does not leave them on the book.
+    cancel_on_start: bool = field(default_factory=lambda: _b("PM_CANCEL_ON_START", True))
 
     # --- Risk / sizing ---
     stake_usdc: float = field(default_factory=lambda: _f("PM_STAKE_USDC", 5.0))
@@ -130,6 +145,10 @@ class Config:
     maker_pull_edge: float = field(default_factory=lambda: _f("PM_MAKER_PULL_EDGE", 0.02))
     maker_requote: float = field(default_factory=lambda: _f("PM_MAKER_REQUOTE", 0.02))
     maker_skew_max: float = field(default_factory=lambda: _f("PM_MAKER_SKEW_MAX", 0.06))
+    # After a risk pull (fair moved against a bid / a side became unquotable)
+    # wait this long before resting a fresh pair, so a fair flickering at the
+    # band edge does not become a pull/re-post cycle on every print.
+    maker_repost_secs: float = field(default_factory=lambda: _f("PM_MAKER_REPOST_SECS", 2.0))
     # Post the bids this many seconds after the window opens (let the book form).
     # 10s was too late on a fast tape: by then the book has tilted and BTC has
     # moved past the defensive line, so we never rested at all (9 Sep session).

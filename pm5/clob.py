@@ -76,10 +76,24 @@ class RestingOrder:
     order_id: str | None = None
     paper: bool = True
     done: bool = False  # cancelled or fully filled
+    # Live orders are placed and cancelled off-thread so the trading loop
+    # never blocks on the CLOB round trip. `pending` = placement in flight
+    # (no id yet); `cancelling` = cancel sent, final fill count not yet
+    # confirmed; `failed` = placement rejected (the maker re-posts).
+    pending: object | None = field(default=None, repr=False, compare=False)
+    cancelling: bool = False
+    cancel_future: object | None = field(default=None, repr=False, compare=False)
+    cancel_sent_at: float = 0.0
+    failed: bool = False
 
     @property
     def remaining(self) -> float:
         return max(0.0, round(self.size - self.filled, 2))
+
+    @property
+    def live(self) -> bool:
+        """On the book (or about to be) and not being taken down."""
+        return not self.done and not self.cancelling
 
 
 def taker_fee_usdc(shares: float, price: float, rate: float) -> float:
@@ -324,13 +338,13 @@ class Executor:
                         paper=True, maker=True)
         return self._live.poll_bid(order, force=force)
 
-    def cancel_bid(self, order: RestingOrder) -> Fill | None:
-        """Cancel a rest. Always re-read live matches first — a bid can fill
-        in the same second we yank it (11:25 ET: Down hit, we logged 0 filled,
-        never recorded, never sold, lost $5). The pre-cancel read may come from
-        the user stream (ms-fresh); the post-cancel read is always HTTP, since
-        the stream may not have delivered the final event yet and that read is
-        the one that decides whether a fill exists.
+    def cancel_bid(self, order: RestingOrder, wait: bool = False) -> Fill | None:
+        """Cancel a rest. A bid can fill in the same second we yank it (11:25
+        ET: Down hit, we logged 0 filled, never recorded, never sold, lost
+        $5), so live cancels stay `cancelling` until the final matched count
+        is confirmed (user stream, else a forced HTTP read) — later polls
+        harvest that fill. `wait=True` blocks for the confirmation (window
+        close, when the maker object is about to go away).
         """
         if order.paper:
             if order.done:
@@ -339,11 +353,19 @@ class Executor:
             log.info("[PAPER] cancel bid %s (%.2f/%.2f filled)",
                      order.side, order.filled, order.size)
             return None
-        fill = self._live.poll_bid(order)
-        if not order.done:
-            self._live.cancel_bid(order)
-            extra = self._live.poll_bid(order, force=True)
-            order.done = True
-            if extra is not None:
-                fill = extra
-        return fill
+        return self._live.cancel_bid(order, wait=wait)
+
+    def presign_bids(self, token_id: str, side: str, shares: float, prices: list[float],
+                     tick_size: float, neg_risk: bool) -> None:
+        """Live: sign likely bids ahead of time. Paper: nothing to do."""
+        if self._live is not None:
+            self._live.presign(token_id, side, shares, prices, tick_size, neg_risk)
+
+    def forget_presigned(self, token_ids) -> None:
+        if self._live is not None:
+            self._live.forget_presigned(token_ids)
+
+    def set_wake(self, cb) -> None:
+        """Thread-safe callable invoked when a background CLOB call finishes."""
+        if self._live is not None:
+            self._live.wake = cb

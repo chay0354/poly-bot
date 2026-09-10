@@ -528,12 +528,12 @@ def test_maker_harvests_fill_that_hit_during_defensive_cancel():
     hidden = Fill("DOWN", "down", 0.46, 10.87, 5.0002, paper=True, maker=True)
     real = ex.cancel_bid
 
-    def harvest(order):
+    def harvest(order, wait=False):
         if order.side == "down" and order.filled == 0:
             order.filled = 10.87
             order.done = True
             return hidden
-        return real(order)
+        return real(order, wait=wait)
 
     ex.cancel_bid = harvest
     fills = mk.step(_book(0.52), _book(0.52), btc=50025.0, open_price=50000.0)

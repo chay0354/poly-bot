@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from py_clob_client_v2 import (
     ClobClient,
@@ -56,7 +58,25 @@ class LiveTrader:
 
             self.user_stream = UserStream(creds.api_key, creds.api_secret, creds.api_passphrase)
         self._last_http_poll: dict[str, float] = {}
+        # Off-thread CLOB calls (place / cancel / pre-sign). httpx.Client is
+        # thread-safe; the CLOB client holds no per-call state.
+        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="clob")
+        self._presigned: dict[tuple, object] = {}
+        self._presign_lock = threading.Lock()
+        # Thread-safe callable that wakes the trading loop when a background
+        # call finishes (set by the bot).
+        self.wake = None
         log.info("live trader ready (sig_type=%s funder=%s)", cfg.signature_type, bool(cfg.funder_address))
+        if cfg.cancel_on_start:
+            # A previous copy that was killed hard (restart, deploy, crash)
+            # may have left bids resting — nobody is watching those. Start
+            # from a clean book.
+            try:
+                resp = self.client.cancel_all()
+                n = len(resp.get("canceled") or []) if isinstance(resp, dict) else "?"
+                log.info("[LIVE] cancelled leftover open orders on start: %s", n)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[LIVE] cancel-all on start failed: %s", e)
 
     LOW_BALANCE_PAUSE = 60.0
     # With the user stream healthy, still confirm each resting order over
@@ -200,35 +220,122 @@ class LiveTrader:
         return amount, round(amount * price, 4)
 
     # ------------------------------------------------------------------ maker
+    #
+    # Placing and cancelling go through a small thread pool: the CLOB round
+    # trip (~110ms from Israel, ~5ms from US-East) must never stall the
+    # asyncio loop that is ingesting Binance / book / fill events, and a
+    # cancel decided on a Binance tick must be on the wire immediately, not
+    # after the loop has finished whatever else it was doing.
+    #
+    # Placement returns a RestingOrder without an id (`pending`); the id is
+    # filled in when the worker finishes. Cancel returns at once with the
+    # order marked `cancelling`; the final matched count is confirmed by the
+    # user stream or a forced HTTP read on a later poll, so a bid that fills
+    # in the same instant we yank it is still harvested. `wait=True` (window
+    # close) blocks until everything is confirmed.
+
+    # How long after sending a cancel we start forcing HTTP reads if the
+    # user stream has not confirmed the final state.
+    CANCEL_CONFIRM_SECS = 0.3
+
+    def presign(self, token_id: str, side: str, shares: float, prices: list[float],
+                tick_size: float, neg_risk: bool) -> None:
+        """Sign the bids we may post on `token_id` ahead of time (worker
+        thread) so `place_bid` is a bare HTTP send. Called when the next
+        window's market is known, ~20s before it opens."""
+        if not self.cfg.presign:
+            return
+        opts = PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=neg_risk)
+
+        def work() -> None:
+            n = 0
+            for price in prices:
+                key = (token_id, round(price, 4), round(shares, 2))
+                with self._presign_lock:
+                    if key in self._presigned:
+                        continue
+                try:
+                    args = OrderArgsV2(token_id=token_id, price=price, size=shares, side=Side.BUY)
+                    signed = self.client.create_order(args, options=opts)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[LIVE] presign %s @ %.2f failed: %s", side, price, e)
+                    continue
+                with self._presign_lock:
+                    self._presigned[key] = signed
+                    n += 1
+            if n:
+                log.info("[LIVE] pre-signed %d %s bids (%.2f–%.2f)", n, side, min(prices), max(prices))
+
+        self._pool.submit(work)
+
+    def _take_presigned(self, token_id: str, price: float, shares: float):
+        key = (token_id, round(price, 4), round(shares, 2))
+        with self._presign_lock:
+            return self._presigned.pop(key, None)
+
+    def forget_presigned(self, token_ids) -> None:
+        """Drop signed orders for markets we are done with."""
+        ids = {str(t) for t in token_ids}
+        with self._presign_lock:
+            for key in [k for k in self._presigned if k[0] in ids]:
+                self._presigned.pop(key, None)
 
     def place_bid(
         self, token_id: str, side: str, price: float, shares: float,
         tick_size: float, neg_risk: bool,
     ) -> RestingOrder | None:
-        """Rest a post-only GTC bid (maker: 0% fee). Rejected if it would cross."""
+        """Rest a post-only GTC bid (maker: 0% fee), off-thread.
+
+        Returns immediately with `pending` set; `poll_bid` resolves it. A
+        reject (e.g. post-only would cross) marks the order `failed` and
+        `done` so the maker re-posts next tick.
+        """
         if self._paused():
             return None
-        args = OrderArgsV2(token_id=token_id, price=price, size=shares, side=Side.BUY)
+        order = RestingOrder(token_id, side, price, shares, paper=False)
         opts = PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=neg_risk)
+
+        def work():
+            signed = self._take_presigned(token_id, price, shares)
+            if signed is None:
+                args = OrderArgsV2(token_id=token_id, price=price, size=shares, side=Side.BUY)
+                signed = self.client.create_order(args, options=opts)
+            return self.client.post_order(signed, order_type=OrderType.GTC, post_only=True)
+
+        order.pending = self._submit(work)
+        return order
+
+    def _submit(self, fn):
+        fut = self._pool.submit(fn)
+        if self.wake is not None:
+            fut.add_done_callback(lambda _f: self.wake())
+        return fut
+
+    def _resolve(self, order: RestingOrder) -> None:
+        """Apply a finished placement to `order` (no-op while in flight)."""
+        fut = order.pending
+        if fut is None or not fut.done():
+            return
+        order.pending = None
         try:
-            resp = self.client.create_and_post_order(
-                args, options=opts, order_type=OrderType.GTC, post_only=True
-            )
+            resp = fut.result()
         except Exception as e:  # noqa: BLE001
             if "not enough balance" in str(e):
-                self._note_reject(e, shares * price)
+                self._note_reject(e, order.size * order.price)
             else:
-                log.error("[LIVE] rest bid failed for %s @ %.2f: %s", side, price, e)
-            return None
-        if not isinstance(resp, dict):
-            log.error("[LIVE] unexpected response resting %s: %s", side, resp)
-            return None
-        order_id = resp.get("orderID") or resp.get("orderId")
-        if not resp.get("success", bool(order_id)) or not order_id:
-            log.error("[LIVE] rest bid rejected for %s: %s", side, resp)
-            return None
-        log.info("[LIVE] REST bid %s %.2f sh @ %.2f (id=%s)", side, shares, price, order_id)
-        return RestingOrder(token_id, side, price, shares, order_id=order_id, paper=False)
+                log.error("[LIVE] rest bid failed for %s @ %.2f: %s", order.side, order.price, e)
+            order.failed = True
+            order.done = True
+            return
+        order_id = resp.get("orderID") or resp.get("orderId") if isinstance(resp, dict) else None
+        if not isinstance(resp, dict) or not resp.get("success", bool(order_id)) or not order_id:
+            log.error("[LIVE] rest bid rejected for %s: %s", order.side, resp)
+            order.failed = True
+            order.done = True
+            return
+        order.order_id = order_id
+        log.info("[LIVE] REST bid %s %.2f sh @ %.2f (id=%s)",
+                 order.side, order.size, order.price, order_id)
 
     def poll_bid(self, order: RestingOrder, force: bool = False) -> Fill | None:
         """Return a Fill for shares matched since the last poll.
@@ -237,10 +344,26 @@ class LiveTrader:
         reconciled over HTTP every RECONCILE_SECS. Without the stream, HTTP
         at most once per HTTP_POLL_SECS per order. `force` = HTTP now.
         """
-        oid = order.order_id or ""
+        self._resolve(order)
+        if order.done or order.order_id is None:
+            return None
+        oid = order.order_id
         now = time.monotonic()
         last = self._last_http_poll.get(oid, 0.0)
         state = self.user_stream.state(oid) if self.user_stream is not None else None
+        if order.cancelling and not force:
+            # The cancel is out; the stream usually confirms within ms. If it
+            # has not, read over HTTP at a tight cadence — this read is what
+            # decides whether the bid filled as we yanked it.
+            fut = order.cancel_future
+            sent = fut is not None and fut.done()
+            if state is not None and state["status"] in {"MATCHED", "CANCELLED", "CANCELED"}:
+                return self._apply_status(order, state["matched"], state["status"])
+            if not sent or now - order.cancel_sent_at < self.CANCEL_CONFIRM_SECS:
+                return None
+            if now - last < self.CANCEL_CONFIRM_SECS:
+                return None
+            force = True
         if not force:
             if state is not None:
                 if now - last < self.RECONCILE_SECS:
@@ -274,10 +397,49 @@ class LiveTrader:
         return Fill(order.token_id, order.side, order.price, new, cost,
                     paper=False, order_id=order.order_id, maker=True)
 
-    def cancel_bid(self, order: RestingOrder) -> None:
+    def cancel_bid(self, order: RestingOrder, wait: bool = False) -> Fill | None:
+        """Take a bid down. Returns any fill already known; more may surface
+        on later polls (the order stays `cancelling` until confirmed).
+
+        `wait=True` blocks until the cancel is acknowledged and the final
+        matched count has been read over HTTP — used at window close so no
+        fill is left unaccounted when the maker object goes away.
+        """
+        if order.done:
+            return None
+        if order.pending is not None:
+            # No id yet: the placement must land before it can be cancelled.
+            try:
+                order.pending.result(timeout=10)
+            except Exception:  # noqa: BLE001 - _resolve logs it
+                pass
+            self._resolve(order)
+            if order.done:
+                return None
+        fill = None
+        if not order.cancelling:
+            fill = self.poll_bid(order)  # stream-fresh; may already show a full match
+            if order.done:
+                return fill
+            order.cancelling = True
+            order.cancel_sent_at = time.monotonic()
+            order.cancel_future = self._submit(lambda: self._do_cancel(order))
+        if wait:
+            try:
+                order.cancel_future.result(timeout=10)
+            except Exception:  # noqa: BLE001 - _do_cancel logged it
+                pass
+            extra = self.poll_bid(order, force=True)
+            order.done = True
+            if extra is not None:
+                fill = extra
+        return fill
+
+    def _do_cancel(self, order: RestingOrder) -> None:
         try:
             self.client.cancel_orders([order.order_id])
             log.info("[LIVE] cancelled bid %s (%.2f/%.2f filled) id=%s",
                      order.side, order.filled, order.size, order.order_id)
         except Exception as e:  # noqa: BLE001
             log.error("[LIVE] cancel %s failed: %s", order.order_id, e)
+            order.cancelling = False  # let the maker try again

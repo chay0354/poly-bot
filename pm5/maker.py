@@ -79,7 +79,8 @@ class MakerPair:
         self._naked_since: float | None = None  # monotonic time we became one-sided
         self._blocked: set[str] = set()  # sides we will not re-post (defensive pull)
         self._limit = cfg.maker_defensive_usd  # current toxic-move line (USD)
-        self._fast_delta: float | None = None  # Binance move since open, if known
+        self._fast_delta: float | None = None  # leading venue's move since open, if known
+        self._fast_src = "binance"
         self._delta_src = "chainlink"
         self._skip: str | None = None  # why we have not rested yet (for close())
         self._fair_up: float | None = None  # model P(Up) this tick, if the tape is known
@@ -87,6 +88,7 @@ class MakerPair:
         self._warned_fair = False
         self.requotes = 0  # cancel/replace count this window (churn gauge)
         self._last_requote: dict[str, float] = {}
+        self._pull_hold: dict[str, float] = {}  # side → time of its last risk pull
         self._tops: dict[str, BookTop | None] = {}
         self._clock = time.monotonic
 
@@ -131,13 +133,15 @@ class MakerPair:
         open_price: float | None = None,
         sigma: float | None = None,
         fast_delta: float | None = None,
+        fast_src: str = "binance",
     ) -> list[Fill]:
         """Post / poll / cancel resting bids. Returns any new fills.
 
         `sigma` is the feed's realized 5-min move; it widens the defensive line
         on a fast tape so noise does not keep us out of every window.
-        `fast_delta` is Binance's move since the open — the leading signal for
-        the defensive cancel when available.
+        `fast_delta` is the leading venue's move since the open (`fast_src`
+        names it: binance / coinbase) — the signal for the defensive cancel
+        and fair value when available.
         """
         m = self.market
         left = m.seconds_left
@@ -145,6 +149,7 @@ class MakerPair:
         self._tops = tops
         self._limit = self._defensive_limit(left, sigma)
         self._fast_delta = fast_delta
+        self._fast_src = fast_src
         self._fair_up = self._fair(btc, open_price, sigma, left)
 
         if (
@@ -224,6 +229,10 @@ class MakerPair:
             if fill is not None:
                 new.append(fill)
                 self.fills.append(fill)
+            if order.failed and order.filled <= 0:
+                # Off-thread placement was rejected (crossed, balance, ...):
+                # the side is not on the book, so let `_post` try again.
+                self.posted = False
         if new:
             log.info("maker fills: %s", self.summary())
         if self.naked_side is None:
@@ -325,8 +334,8 @@ class MakerPair:
         if self._fair_up is None or self.hedged or self.exited or self.cancelled:
             return found
         for side, order in list(self.orders.items()):
-            if order.done:
-                continue
+            if not order.live:
+                continue  # done, or a cancel is already on the wire
             fair = self._fair_side(side)
             edge_now = fair - order.price
             if edge_now < self.cfg.maker_pull_edge - 1e-9:
@@ -338,6 +347,7 @@ class MakerPair:
                     found.append(fill)
                 self.requotes += 1
                 self.posted = False
+                self._pull_hold[side] = self._clock()
                 continue
             relax = bool(self.fills) and self.shares(side) < 0.01
             # Compare against the price we could actually post (stepped under
@@ -369,7 +379,16 @@ class MakerPair:
             log.info("maker: never rested this window (%s)", self._skip or "no reason recorded")
         elif self.requotes:
             log.info("maker: %d re-quotes this window", self.requotes)
-        return self._cancel_all("window closed")
+        found = self._cancel_all("window closed")
+        # Anything still unconfirmed (an async pull whose final matched count
+        # has not been read yet) is confirmed now, blocking: after this the
+        # order is never polled again.
+        for o in list(self.orders.values()):
+            if not o.done:
+                fill = self._cancel_one(o, "window closed", wait=True)
+                if fill is not None:
+                    found.append(fill)
+        return found
 
     def _defensive_limit(self, left: float, sigma: float | None) -> float:
         """Toxic-move line in USD: fixed floor, widened by the realized tape.
@@ -413,7 +432,10 @@ class MakerPair:
         if side is None:
             return None
         other = "down" if side == "up" else "up"
-        if self._bid_live(other):
+        leftover = self.orders.get(other)
+        if leftover is not None and not leftover.done:
+            # Still on the book, or its cancel is not confirmed yet: it may
+            # fill any instant, and a taker buy on top would double the side.
             return None
         top = down_top if other == "down" else up_top
         if top is None or top.best_ask is None:
@@ -535,7 +557,14 @@ class MakerPair:
             if qty * (1.0 - all_in) > sell_pnl + 1e-9:
                 leftover = self.orders.get(other)
                 if leftover is not None and not leftover.done:
-                    self._cancel_one(leftover, "exit via pair")
+                    # Taking the complement while our own bid on it may still
+                    # fill would double that side. Confirm the cancel first
+                    # (blocking; this is an exit, not the hot path), and if
+                    # the bid filled meanwhile we are paired — nothing to buy.
+                    if self._cancel_one(leftover, "exit via pair", wait=True) is not None:
+                        return None
+                    if not leftover.done:
+                        return None
                 return Signal(
                     kind="maker-pair",
                     legs=[Leg(
@@ -626,9 +655,10 @@ class MakerPair:
                 if fill is not None:
                     found.append(fill)
             self.posted = False
+            self._pull_hold["up"] = self._pull_hold["down"] = self._clock()
             return found
         if not self.fills:
-            live = [o for o in self.orders.values() if not o.done]
+            live = self._live_orders()
             if not live:
                 # Nothing resting, nothing to protect. Do NOT block the side:
                 # if the move fades we want to rest the full pair, not one leg.
@@ -637,6 +667,7 @@ class MakerPair:
                 "maker: defensive cancel pair (BTC Δopen=%+.1f ≥ %.0f, %s, nothing filled)",
                 delta, self._limit, src,
             )
+            self._pull_hold["up"] = self._pull_hold["down"] = self._clock()
             for o in live:
                 fill = self._cancel_one(o, "defensive pair")
                 if fill is not None:
@@ -653,7 +684,7 @@ class MakerPair:
         if self.shares(toxic) > 0.01:
             return found
         order = self.orders.get(toxic)
-        if order is None or order.done:
+        if order is None or not order.live:
             return found
         log.info(
             "maker: defensive cancel %s bid (BTC Δopen=%+.1f ≥ %.0f, %s)",
@@ -672,7 +703,7 @@ class MakerPair:
         Binance already reverted to +5 is not a dump in progress.
         """
         if self._fast_delta is not None:
-            self._delta_src = "binance"
+            self._delta_src = self._fast_src
             return self._fast_delta
         self._delta_src = "chainlink"
         if btc is None or open_price is None:
@@ -710,7 +741,7 @@ class MakerPair:
         found: list[Fill] = []
         wanted = self._wanted_shares()
         for side, order in list(self.orders.items()):
-            if order.done:
+            if not order.live:
                 continue
             if self.hedged or self.exited or self.shares(side) >= wanted - 0.01:
                 log.info("maker: pulling %s bid (%s)", side, why)
@@ -719,8 +750,11 @@ class MakerPair:
                     found.append(fill)
         return found
 
-    def _cancel_one(self, order: RestingOrder, why: str) -> Fill | None:
-        fill = self.executor.cancel_bid(order)
+    def _cancel_one(self, order: RestingOrder, why: str, wait: bool = False) -> Fill | None:
+        """Take one bid down. Live cancels return at once and are confirmed
+        on later polls (a fill that lands as we yank shows up there); `wait`
+        blocks for the confirmation."""
+        fill = self.executor.cancel_bid(order, wait=wait)
         if fill is not None:
             self.fills.append(fill)
             log.info("maker: harvested %s %.2f sh on cancel (%s)", fill.side, fill.size, why)
@@ -796,12 +830,20 @@ class MakerPair:
         px = self.cfg.maker_bid
         return max(self.market.min_size, round(self.cfg.maker_stake_usdc / px, 2))
 
-    def _live_orders(self) -> list[RestingOrder]:
-        return [o for o in self.orders.values() if not o.done]
+    def _cooling(self, side: str) -> bool:
+        """After a risk pull, do not re-post that side the moment fair ticks
+        back. The loop runs on every Binance print now; on a quiet tape a $2
+        flicker swings fair by a few cents, and without this the maker cycled
+        pull-pair → re-post → pull-pair twice a second (paper, 10:31). With a
+        leg filled, pairing beats patience: no cooldown."""
+        if self.fills:
+            return False
+        t = self._pull_hold.get(side)
+        return t is not None and self._clock() - t < self.cfg.maker_repost_secs
 
-    def _bid_live(self, side: str) -> bool:
-        order = self.orders.get(side)
-        return order is not None and not order.done
+    def _live_orders(self) -> list[RestingOrder]:
+        """Bids on the book (or in flight to it) — not ones being taken down."""
+        return [o for o in self.orders.values() if o.live]
 
     def _post(self, tops: dict[str, BookTop | None], relax: bool = False) -> None:
         """Rest any missing bid. Only mark posted once BOTH sides are on the book.
@@ -814,6 +856,7 @@ class MakerPair:
         tick = m.tick_size or 0.01
         shares = self._wanted_shares()
         attempted = 0
+        cooling = 0
         for side in ("up", "down"):
             if side in self._blocked:
                 continue
@@ -821,6 +864,9 @@ class MakerPair:
                 continue
             existing = self.orders.get(side)
             if existing is not None and not existing.done:
+                continue  # on the book, in flight, or being taken down
+            if self._cooling(side):
+                cooling += 1
                 continue
             px = self._bid_for(side, tops, relax)
             if px is None:
@@ -831,14 +877,23 @@ class MakerPair:
             )
             if order is not None:
                 self.orders[side] = order
+        # A bid whose cancel is in flight is not "on": leave `posted` False so
+        # the side is re-quoted once the cancel is confirmed (otherwise the
+        # pull in `_maybe_requote` would be the last thing that ever happened
+        # to that side).
         live_or_filled = sum(
             1 for side in ("up", "down")
             if self.shares(side) > 0 or (
-                side in self.orders and not self.orders[side].done
+                side in self.orders and self.orders[side].live
             )
         )
         if live_or_filled == 2 or (self.shares("up") > 0 and self.shares("down") > 0):
             self.posted = True
+            return
+        if cooling:
+            # The missing side is deliberately off the book for a moment; not
+            # a reject to warn about.
+            self._skip = f"cooling down {self.cfg.maker_repost_secs:.0f}s after a pull"
             return
         if attempted == 0:
             return
@@ -862,6 +917,9 @@ class MakerPair:
         return []
 
     def _cancel_all(self, why: str) -> list[Fill]:
+        """Take every bid down and *confirm* it: this runs at the cutoff and
+        at window close, after which nobody polls these orders again, so a
+        fill that landed during the cancel must be harvested here."""
         if self.cancelled:
             return []
         self.cancelled = True
@@ -870,10 +928,22 @@ class MakerPair:
             log.info("maker: cancelling %d resting bid(s) (%s)", len(live), why)
         found: list[Fill] = []
         for o in live:
-            fill = self._cancel_one(o, why)
+            fill = self._cancel_one(o, why, wait=True)
             if fill is not None:
                 found.append(fill)
         return found
+
+    @staticmethod
+    def quote_grid(cfg: Config, market: Market) -> tuple[float, list[float]]:
+        """(shares, prices) a pair may rest at this window: the fair band
+        around the base bid on the tick grid. Used to pre-sign live orders
+        before the window opens."""
+        tick = market.tick_size or 0.01
+        shares = max(market.min_size, round(cfg.maker_stake_usdc / cfg.maker_bid, 2))
+        lo = round(cfg.maker_bid - cfg.maker_skew_max, 2)
+        hi = round(cfg.maker_bid + cfg.maker_skew_max, 2)
+        n = int(round((hi - lo) / tick)) + 1
+        return shares, [round(lo + i * tick, 2) for i in range(n)]
 
 
 def _fmt(top: BookTop | None) -> str:

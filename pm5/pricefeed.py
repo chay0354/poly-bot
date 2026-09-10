@@ -121,6 +121,7 @@ class ChainlinkFeed:
         self._history: list[Tick] = []
         self._first_src_ts: float | None = None
         self._connected = asyncio.Event()
+        self.on_tick = None  # trading loop wake-up hook (same thread)
 
     async def run(self) -> None:
         """Connect-and-consume loop with reconnect. Run as a background task."""
@@ -171,6 +172,8 @@ class ChainlinkFeed:
             i += 1
         if i:
             self._history = self._history[i:]
+        if self.on_tick is not None:
+            self.on_tick()
 
     async def wait_connected(self, timeout: float = 15.0) -> bool:
         try:

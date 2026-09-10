@@ -56,14 +56,36 @@ window (`_trade_window`) wires the pieces together:
  `price_change` deltas); `BookReader.top` reads from it and only falls back to
  HTTP `/book` when the stream is not healthy or has no snapshot. `UserStream`
  (auth, live mode) carries our own order events so `LiveTrader.poll_bid` sees
- fills in ms and only reconciles over HTTP every few seconds. With both books
- off the socket the loop runs at `PM_FAST_POLL` (0.25s) instead of
- `PM_POLL_INTERVAL`. The next window's books are subscribed ~20s early.
+ fills in ms and only reconciles over HTTP every few seconds. The next
+ window's books are subscribed ~20s early.
+- **Event-driven loop** — the window loop does not poll on a timer: every
+ Binance/Coinbase print, Chainlink tick, book change, order event and finished
+ background CLOB call sets `Bot._wake`, and `_wait_tick` returns at once
+ (coalesced to one iteration per `PM_MIN_TICK`). `PM_FAST_POLL` /
+ `PM_POLL_INTERVAL` are only idle timeouts. A defensive cancel therefore goes
+ out on the tick that triggered it, not up to 250ms later.
+- **Fast feeds** (`fastfeed.py`) — `BinanceFeed` and `CoinbaseFeed` share
+ `TradeFeed`; `FastFeeds` answers `delta_since` / `realized_vol` from whichever
+ venue printed most recently (first mover wins) and **never mixes venues in a
+ delta** (BTCUSDT vs BTC-USD carry a basis). A venue that did not cover the
+ open is skipped for that window's Δ. Settlement stays on Chainlink.
 - **Execution** (`clob.py` → `live.py`) — `Executor.buy` simulates in paper mode or
  delegates to `LiveTrader` in live mode. `Executor.sell` walks the bid depth
  (`BookTop.sell_plan`) and the live order is a **FAK** down to that price — a
  thin top level must never block an exit (two $5 legs were carried to a $0
- resolution on 10 Sep because of a "top size < shares" refusal).
+ resolution on 10 Sep because of a "top size < shares" refusal). **Live
+ place/cancel are off-thread** (`LiveTrader._pool`): `place_bid` returns a
+ `RestingOrder` with `pending` set (id arrives on a later `poll_bid`);
+ `cancel_bid` returns at once with the order `cancelling`, and the final
+ matched count is confirmed by the user stream or a forced HTTP read on a
+ later poll — so a bid that fills as we yank it is still harvested. The maker
+ treats `cancelling` as *not live* (no re-pull, no re-post, `posted` stays
+ False) but *not done* (no taker-buy of the complement while it might still
+ fill). `cancel_bid(wait=True)` blocks for confirmation: `_cancel_all` /
+ `close()` and the exit-via-pair path use it, because after those nobody
+ polls the order again. `PM_PRESIGN` signs the next window's likely bids
+ (`MakerPair.quote_grid`) when the market is prefetched, so a post is a bare
+ HTTP send; a signed order is consumed once and dropped at window end.
 - **Settlement** — the market resolves on the **Chainlink 60s TWAP** at close vs.
  the open snapshot (rules changed Aug 2026), so paper positions settle against
  `feed.twap(end-60, end)`, and momentum decides on `feed.projected_close(...)`
@@ -74,7 +96,7 @@ window (`_trade_window`) wires the pieces together:
   our bid. After one fill, wait for the leftover maker bid — do not taker-buy
   the other side while it is still live, and count the 7% taker fee in any
  pair-complete cap. **Fair-value quoting** (`maker.fair_up`, `PM_MAKER_FAIR`):
- once the realized 5-min range is known, p_up = Φ(Binance Δ since open / σ of
+ once the realized 5-min range is known, p_up = Φ(fast-feed Δ since open / σ of
  the move still possible); each bid rests at fair − `PM_MAKER_EDGE`, is pulled
  when fair − bid < `PM_MAKER_PULL_EDGE`, re-quoted when ≥ `PM_MAKER_REQUOTE`
  off target, and stays inside bid ± `PM_MAKER_SKEW_MAX`. A side whose target
@@ -114,8 +136,12 @@ window (`_trade_window`) wires the pieces together:
   (`feed.witnessed_open`). A bot started mid-window never saw the true open, so it
   runs **arbitrage-only** for that window. Arbitrage is book-based and always safe.
  The maker gets `witnessed=` too: in an unwitnessed window it rests only once
- Binance can give a Δ vs the open (a blind 0.46 rest at T+70s into a leaning
+ a fast feed can give a Δ vs the open (a blind 0.46 rest at T+70s into a leaning
  book is a guaranteed adverse fill).
+- **A live order is never "gone" until `done`.** With off-thread cancels an
+ order sits in `cancelling` for a few hundred ms; anything that would buy the
+ same side (pair completion, exit-via-pair) must wait for `done`, and any path
+ after which the order is no longer polled must use `cancel_bid(wait=True)`.
 - **Arbitrage is all-or-none** (`_execute_arb`). It re-reads both books fresh and
   aborts unless every leg is still fillable — a half-filled arb is naked
   directional risk, the opposite of the intent.

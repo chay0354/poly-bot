@@ -105,10 +105,17 @@ def test_maker_pulls_bid_when_fair_moves_against_it():
     assert not mk.orders["up"].done and not mk.orders["down"].done
     # BTC drops $8: fair up ≈ 0.47 → the 0.46 Up bid has < 0.02 edge → pulled.
     # Down (fair 0.53) is now 0.07 above its bid → re-quoted higher.
+    now = [1000.0]
+    mk._clock = lambda: now[0]
     mk.step(_book(0.50), _book(0.54), sigma=150.0, fast_delta=-8.0)
     assert mk.orders["up"].done
     assert mk.requotes >= 1
-    # Next tick both sides are back on the book at fair-based prices.
+    # Next tick the re-quoted Down is straight back on the book; the pulled
+    # Up waits out the re-post cooldown, then returns at its fair-based price.
+    mk.step(_book(0.50), _book(0.54), sigma=150.0, fast_delta=-8.0)
+    assert mk.orders["up"].done and not mk.orders["down"].done
+    assert "cooling down" in (mk._skip or "")
+    now[0] += cfg.maker_repost_secs + 0.1
     mk.step(_book(0.50), _book(0.54), sigma=150.0, fast_delta=-8.0)
     assert not mk.orders["up"].done and not mk.orders["down"].done
     assert mk.orders["up"].price < 0.46 <= mk.orders["down"].price
@@ -117,6 +124,8 @@ def test_maker_pulls_bid_when_fair_moves_against_it():
 
 def test_maker_unquotable_side_pulls_pair_without_standing_down():
     cfg, ex, m, mk = _maker()
+    now = [1000.0]
+    mk._clock = lambda: now[0]
     mk.step(_book(0.52), _book(0.52), sigma=60.0, fast_delta=0.0)
     assert len(mk._live_orders()) == 2
     # Quiet tape, Binance +$15 while the book still shows 0.52/0.52 (Binance
@@ -126,6 +135,7 @@ def test_maker_unquotable_side_pulls_pair_without_standing_down():
     assert not mk._stood_down and not mk._blocked
     assert "unquotable" in (mk._skip or "")
     # Book catches up; still nothing while the move holds.
+    now[0] += 5.0
     mk.step(_book(0.72), _book(0.30), sigma=60.0, fast_delta=15.0)
     assert mk._live_orders() == [] and not mk.fills
     # Move fades: quote the full pair again, no window lost.

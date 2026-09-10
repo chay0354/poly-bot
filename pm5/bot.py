@@ -22,7 +22,7 @@ from . import net
 from .clob import BookReader, Executor, Fill
 from .clobws import MarketStream
 from .config import Config
-from .fastfeed import BinanceFeed
+from .fastfeed import BinanceFeed, CoinbaseFeed, FastFeeds
 from .ledger import DayLedger
 from .maker import MakerPair
 from .markets import WINDOW_SECS, Market, MarketDiscovery, current_window_start
@@ -68,7 +68,21 @@ class Bot:
         self.reader = BookReader(cfg.clob_url, self._http, stream=self.market_stream)
         self.executor = Executor(cfg, self.reader)
         self.feed = ChainlinkFeed(cfg.ws_live_url, net.WS_LIVE_HOST)
-        self.fast = BinanceFeed(cfg.fast_feed_url) if cfg.fast_feed else None
+        # The loop is event-driven: every feed tick, book change and order
+        # event sets `_wake`; the loop's sleep is only an idle timeout.
+        self._wake = asyncio.Event()
+        self._last_tick = 0.0
+        self.feed.on_tick = self._wake.set
+        fast_feeds = []
+        if cfg.fast_feed:
+            fast_feeds.append(BinanceFeed(cfg.fast_feed_url, on_tick=self._wake.set))
+        if cfg.coinbase_feed:
+            fast_feeds.append(CoinbaseFeed(cfg.coinbase_feed_url, on_tick=self._wake.set))
+        self.fast = FastFeeds(fast_feeds) if fast_feeds else None
+        if self.market_stream is not None:
+            self.market_stream.on_event = self._wake.set
+        if self.executor.user_stream is not None:
+            self.executor.user_stream.on_event = self._wake.set
         self.momentum = MomentumStrategy(cfg, self.feed)
         self.arb = ArbitrageStrategy(cfg, self.reader)
         self.recorder = Recorder(cfg.data_file, enabled=cfg.record, mode=cfg.mode)
@@ -84,6 +98,9 @@ class Bot:
         return self.ledger.today()
 
     async def run(self) -> None:
+        loop = asyncio.get_running_loop()
+        # Background CLOB calls finish on worker threads; wake the loop safely.
+        self.executor.set_wake(lambda: loop.call_soon_threadsafe(self._wake.set))
         tasks = [asyncio.create_task(self.feed.run())]
         if self.fast is not None:
             tasks.append(asyncio.create_task(self.fast.run()))
@@ -191,6 +208,8 @@ class Bot:
             MakerPair(self.cfg, self.executor, market, witnessed=witnessed)
             if self.cfg.maker_enabled and self.cfg.mode != "signal" else None
         )
+        if maker is not None:
+            self._presign(market)  # no-op if the prefetch already did it
         ticks = 0
         ws_reads0, http_reads0 = self.reader.ws_reads, self.reader.http_reads
         t_loop0 = time.monotonic()
@@ -241,6 +260,8 @@ class Bot:
                             market.up_token, market.down_token,
                             next_market.up_token, next_market.down_token,
                         ])
+                        if maker is not None:
+                            self._presign(next_market)
 
                 if maker is not None:
                     tick = self.feed.latest
@@ -255,6 +276,7 @@ class Bot:
                     fills = maker.step(
                         up_top, down_top, btc=btc, open_price=open_price,
                         sigma=sigma, fast_delta=fast_delta,
+                        fast_src=self.fast.delta_source if self.fast is not None else "binance",
                     )
                     for f in fills:
                         position.add(f)
@@ -295,7 +317,7 @@ class Bot:
                             self._record_fills(market, signal, fills, open_price)
 
                 self._render_status(market, open_price, up_top, down_top, position)
-                await asyncio.sleep(self._tick_secs(up_top, down_top))
+                await self._wait_tick(self._tick_secs(up_top, down_top))
         finally:
             if maker is not None:
                 late = maker.close()  # never leave a bid resting into the next window
@@ -306,24 +328,52 @@ class Bot:
                         market, Signal("maker", [], "harvest on window close"),
                         late, open_price,
                     )
+                self.executor.forget_presigned([market.up_token, market.down_token])
             elapsed = max(time.monotonic() - t_loop0, 1e-6)
             log.info(
-                "loop: %d ticks in %.0fs (%.2fs/tick) | books %d ws / %d http",
+                "loop: %d ticks in %.0fs (%.3fs/tick) | books %d ws / %d http | fast feed %s",
                 ticks, elapsed, elapsed / max(ticks, 1),
                 self.reader.ws_reads - ws_reads0, self.reader.http_reads - http_reads0,
+                (self.fast.source or "down") if self.fast is not None else "off",
             )
 
         self._settle_window(market, position, open_price, witnessed, path)
 
+    def _presign(self, market: Market) -> None:
+        """Live: sign this market's likely bids off-thread so the first post
+        of the window is a bare HTTP send."""
+        shares, prices = MakerPair.quote_grid(self.cfg, market)
+        tick = market.tick_size or 0.01
+        for side in ("up", "down"):
+            self.executor.presign_bids(
+                market.token_for(side), side, shares, prices, tick, market.neg_risk,
+            )
+
     def _tick_secs(self, up_top, down_top) -> float:
-        """Loop cadence: fast while both books come off the WebSocket (a tick
-        is then pure computation), the HTTP interval otherwise."""
+        """Idle timeout between iterations: short while both books come off
+        the WebSocket, the HTTP interval otherwise. Any event ends the wait
+        early (see `_wait_tick`)."""
         if (
             up_top is not None and down_top is not None
             and up_top.source == "ws" and down_top.source == "ws"
         ):
             return self.cfg.fast_poll_secs
         return self.cfg.poll_interval_secs
+
+    async def _wait_tick(self, timeout: float) -> None:
+        """Sleep until something happened (feed tick, book change, order
+        event, background call finished) or `timeout` elapsed. Wakes are
+        coalesced to at most one iteration per `min_tick_secs` so a burst of
+        prints does not run the maker ten times for one move."""
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        gap = self.cfg.min_tick_secs - (time.monotonic() - self._last_tick)
+        if gap > 0:
+            await asyncio.sleep(gap)
+        self._wake.clear()
+        self._last_tick = time.monotonic()
 
     def _pick_signal(
         self, market: Market, allow_momentum: bool, up_top, down_top
