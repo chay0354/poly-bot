@@ -88,11 +88,19 @@ window (`_trade_window`) wires the pieces together:
  polls the order again. `PM_PRESIGN` signs the next window's likely bids
  (`MakerPair.quote_grid`) when the market is prefetched, so a post is a bare
  HTTP send; a signed order is consumed once and dropped at window end.
-- **Settlement** — the market resolves on the **Chainlink 60s TWAP** at close vs.
- the open snapshot (rules changed Aug 2026), so paper positions settle against
- `feed.twap(end-60, end)`, and momentum decides on `feed.projected_close(...)`
- plus its `flip_needed` margin — not on the last tick. Live positions settle
- on-chain.
+- **Settlement** — the market resolves on the **Chainlink 60s TWAP stream**
+ (`crypto_prices_twap_sixty` on the same websocket): Up iff its value at the
+ window end ≥ its value at the open (the site's "Price To Beat"). `TwapFeed`
+ (`pricefeed.py`, `PM_TWAP_FEED`) streams it; `Bot._open_ref` reads the beat
+ once the update stamped at the open has landed (they arrive ~3s late) and
+ `Bot._close_ref` waits (≤6s) for the update stamped at the end. Reading the
+ open off the *spot* stream mislabelled 77/653 windows (all small moves), so
+ the spot path (`price_at_or_after` / `feed.twap(end-60,end)`) is only the
+ fallback, tagged `settle_src="spot"` in the window record. Every fast-feed Δ
+ is shifted by `open_gap` = spot-at-open − beat so fair value is measured
+ against what the market actually resolves on. Momentum still decides on
+ `feed.projected_close(...)` plus its `flip_needed` margin. Live positions
+ settle on-chain.
 - **Maker pair** (`maker.py`, `PM_MAKER`) — rests post-only GTC bids on both
   sides early in the window; paper fills are simulated when the best ask crosses
   our bid. After one fill, wait for the leftover maker bid — do not taker-buy
@@ -110,6 +118,26 @@ window (`_trade_window`) wires the pieces together:
  rather than hold to resolution; the sell may walk `PM_MAKER_EXIT_SLIP` under
  the top bid. `MakerPair.close()` must always run at window end (it's in a
  `finally`) so no bid is left resting into the next market.
+- **Jump study + sniper** (`jumps.py`, `sniper.py`) — the mirror of the maker's
+ losses: after a Binance/Coinbase jump the side that got dearer is still
+ offered at its old price for some ms, and whoever hits it earns
+ (new fair − old ask). `FastFeeds.jump(window)` is the short-window move on
+ the venue that printed last (never mixing venues); `JumpWatch` opens a
+ `JumpRecord` when |Δ| ≥ max(`PM_JUMP_MIN_USD`, `PM_JUMP_SIGMA`·σ_window) and
+ then watches the books for `gone_ms` = first tick a `min_size` buy at ≤ ask0
+ no longer fits (`BookTop.offered_at`), plus the ask at 1s/3s and the outcome,
+ appending one line per jump to `data/jumps.jsonl`. **The sniper is gated on
+ that study** (`PM_SNIPE`, off by default): `Sniper.evaluate` fires once per
+ jump when fair_after − ask ≥ `PM_SNIPE_MIN_EDGE`, the offered size covers
+ `PM_SNIPE_SHARES`, and the jump is < `PM_SNIPE_MAX_AGE_MS` old; the buy is a
+ pre-signed FAK sent off-thread (`Executor.take` → `PendingTake`, read back by
+ `poll_take` on later ticks, never blocking the loop). **Paper is
+ latency-honest**: a simulated take lands `PM_SIM_LATENCY_MS` after it is
+ sent and fills only if the quote survived the whole way — a vanished quote
+ is a lost race, not a fill. A held snipe settles like any position; the
+ optional scalp (`PM_SNIPE_SCALP`) sells back at entry + `PM_SNIPE_TAKE`.
+ `PM_SNIPE_KILL_STREAK` losing snipes in a row stand the sniper down for the
+ UTC day (someone is faster; the quotes we are hitting are bait).
 - **Daily loss limit** (`ledger.py`, `PM_DAILY_LOSS_LIMIT`) — per-UTC-day P&L
  persisted to `data/day_pnl_{mode}.json`. Live windows are *estimated*
  (`supabase_log.estimated_pnl`: pairs pay $1, exits are realized, a held leg

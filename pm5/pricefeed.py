@@ -106,6 +106,8 @@ class ChainlinkFeed:
     """Maintains the latest BTC/USD tick and a short rolling history."""
 
     SYMBOL = "btc/usd"
+    TOPIC = "crypto_prices_chainlink"
+    NAME = "price feed"
     SUBSCRIBE = {
         "action": "subscribe",
         "subscriptions": [{"topic": "crypto_prices_chainlink", "type": "update"}],
@@ -134,12 +136,12 @@ class ChainlinkFeed:
                     await ws.send(json.dumps(self.SUBSCRIBE))
                     self._connected.set()
                     backoff = 1.0
-                    log.info("price feed connected")
+                    log.info("%s connected", self.NAME)
                     async for raw in ws:
                         self._ingest(raw)
             except Exception as e:  # noqa: BLE001 - reconnect on anything
                 self._connected.clear()
-                log.warning("price feed disconnected (%s); reconnecting in %.0fs", e, backoff)
+                log.warning("%s disconnected (%s); reconnecting in %.0fs", self.NAME, e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
@@ -148,7 +150,7 @@ class ChainlinkFeed:
             msg = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return
-        if msg.get("topic") != "crypto_prices_chainlink":
+        if not isinstance(msg, dict) or msg.get("topic") != self.TOPIC:
             return
         payload = msg.get("payload")
         if not isinstance(payload, dict) or "value" not in payload:
@@ -268,3 +270,49 @@ class ChainlinkFeed:
         if ref is None:
             return None
         return self.latest.price - ref.price
+
+
+class TwapFeed(ChainlinkFeed):
+    """Chainlink's 60-second BTC/USD TWAP stream — the market's resolution
+    source, on the same websocket (`crypto_prices_twap_sixty`).
+
+    Both ends of a window are read from *this* stream: the "price to beat"
+    is its value at the open and the close is its value at the end. Reading
+    the open off the spot stream instead mislabelled 77 of 653 windows
+    (every one a small move, |close − open| < $30) — the spot tick at the
+    open and the 60s average ending at the open differ by a few dollars,
+    and that is the whole outcome on a quiet window. Updates carry a whole-
+    second source `timestamp` and arrive ~3s later, so a settlement has to
+    wait for the tick stamped at the window end (`wait_for`).
+    """
+
+    TOPIC = "crypto_prices_twap_sixty"
+    NAME = "twap feed"
+    SUBSCRIBE = {
+        "action": "subscribe",
+        "subscriptions": [{"topic": "crypto_prices_twap_sixty", "type": "update"}],
+    }
+
+    def value_at(self, ts: float) -> float | None:
+        """The stream's value at source time `ts`: the last update stamped
+        at or before it. None if our history does not reach back that far
+        (we were not listening yet), never the first tick *after* it."""
+        val = None
+        for t in self._history:
+            if t.src_ts <= ts + 1e-6:
+                val = t.price
+            else:
+                break
+        return val
+
+    def witnessed_open(self, window_start: float) -> bool:
+        return self.value_at(window_start) is not None
+
+    async def wait_for(self, ts: float, timeout: float) -> bool:
+        """Block until an update stamped ≥ `ts` has arrived (or `timeout`)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.latest is not None and self.latest.src_ts >= ts - 1e-6:
+                return True
+            await asyncio.sleep(0.05)
+        return self.latest is not None and self.latest.src_ts >= ts - 1e-6

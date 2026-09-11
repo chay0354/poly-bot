@@ -21,7 +21,7 @@ from py_clob_client_v2 import (
 )
 from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
-from .clob import Fill, RestingOrder
+from .clob import Fill, PendingTake, RestingOrder
 from .config import Config
 
 log = logging.getLogger("pm5.live")
@@ -324,6 +324,90 @@ class LiveTrader:
         )
         return Fill(token_id, side, round(avg, 4), -matched, -round(proceeds, 4),
                     paper=False, order_id=order_id)
+
+    # ------------------------------------------------------------------ taker
+    #
+    # The sniper's buy: a limit order at the stale ask posted as FAK (take
+    # what is there at ≤ price, kill the rest), off-thread, pre-signed when
+    # the window was prefetched so the send is one HTTP round trip.
+
+    def take(self, token_id: str, side: str, price: float, shares: float,
+             tick_size: float, neg_risk: bool) -> PendingTake | None:
+        if self._paused():
+            return None
+        opts = PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=neg_risk)
+
+        def work():
+            signed = self._take_presigned(token_id, price, shares)
+            if signed is None:
+                args = OrderArgsV2(token_id=token_id, price=price, size=shares, side=Side.BUY)
+                signed = self.client.create_order(args, options=opts)
+            return self.client.post_order(signed, order_type=OrderType.FAK)
+
+        pt = PendingTake(token_id, side, price, shares, paper=False, sent_at=time.monotonic())
+        pt.future = self._submit(work)
+        return pt
+
+    def poll_take(self, pt: PendingTake) -> Fill | None:
+        fut = pt.future
+        if pt.done or fut is None or not fut.done():
+            return None
+        pt.done = True
+        ms = (time.monotonic() - pt.sent_at) * 1000.0
+        try:
+            resp = fut.result()
+        except Exception as e:  # noqa: BLE001
+            if not self._note_geoblock(e):
+                if "not enough balance" in str(e):
+                    self._note_reject(e, pt.shares * pt.price)
+                log.error("[LIVE] take %s @ %.2f failed: %s", pt.side, pt.price, e)
+            pt.reason = f"rejected: {e}"
+            return None
+        if not isinstance(resp, dict):
+            pt.reason = f"unexpected response {resp!r}"
+            log.error("[LIVE] take %s: %s", pt.side, pt.reason)
+            return None
+        order_id = resp.get("orderID") or resp.get("orderId")
+        if not resp.get("success", bool(order_id)):
+            pt.reason = f"rejected: {resp}"
+            log.error("[LIVE] take %s rejected: %s", pt.side, resp)
+            return None
+        shares, cost = self._buy_amounts(resp, order_id, pt.shares, pt.price)
+        if shares <= 0:
+            pt.reason = f"quote gone (status={resp.get('status')}) after {ms:.0f}ms"
+            log.info("[LIVE] TAKE %s missed: %s", pt.side, pt.reason)
+            return None
+        avg = cost / shares if shares > 0 else pt.price
+        log.info("[LIVE] TAKE %s %.2f sh @ %.3f = $%.2f after %.0fms (id=%s%s)",
+                 pt.side, shares, avg, cost, ms, order_id,
+                 "" if shares >= pt.shares - 1e-9 else f", partial of {pt.shares:.2f}")
+        pt.fill = Fill(pt.token_id, pt.side, round(avg, 4), shares, round(cost, 4),
+                       paper=False, order_id=order_id)
+        return pt.fill
+
+    def _buy_amounts(self, resp: dict, order_id, shares: float, price: float) -> tuple[float, float]:
+        """(shares received, USDC paid) for a marketable buy. On a BUY the
+        CLOB's makingAmount is the USDC we give and takingAmount the shares
+        we get — the mirror of `_matched_amounts`."""
+        making = _num(resp.get("makingAmount"))
+        taking = _num(resp.get("takingAmount"))
+        if taking is not None and taking > 0:
+            return round(taking, 2), round(making if making is not None else taking * price, 4)
+        status = str(resp.get("status") or "").lower()
+        if status in {"unmatched", "killed", "cancelled", "canceled"}:
+            return 0.0, 0.0
+        if order_id:
+            try:
+                o = self.client.get_order(order_id)
+                if isinstance(o, dict):
+                    m = _num(o.get("size_matched"))
+                    if m is not None:
+                        return round(m, 2), round(m * price, 4)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[LIVE] get_order after take failed: %s", e)
+        if status == "matched":
+            return shares, round(shares * price, 4)
+        return 0.0, 0.0
 
     def _matched_amounts(self, resp: dict, order_id, amount: float, price: float) -> tuple[float, float]:
         """(shares matched, USDC proceeds) for a marketable sell.

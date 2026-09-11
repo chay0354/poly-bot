@@ -23,11 +23,13 @@ from .clob import BookReader, Executor, Fill
 from .clobws import MarketStream
 from .config import Config
 from .fastfeed import BinanceFeed, CoinbaseFeed, FastFeeds
+from .jumps import JumpWatch
 from .ledger import DayLedger
 from .maker import MakerPair
 from .markets import WINDOW_SECS, Market, MarketDiscovery, current_window_start
-from .pricefeed import ChainlinkFeed
+from .pricefeed import ChainlinkFeed, TwapFeed
 from .recorder import Recorder
+from .sniper import Sniper
 from .status import LiveStatus
 from .strategy import ArbitrageStrategy, MomentumStrategy, Signal
 from .supabase_log import estimated_pnl
@@ -68,11 +70,16 @@ class Bot:
         self.reader = BookReader(cfg.clob_url, self._http, stream=self.market_stream)
         self.executor = Executor(cfg, self.reader)
         self.feed = ChainlinkFeed(cfg.ws_live_url, net.WS_LIVE_HOST)
+        # The 60s TWAP stream the market actually resolves on: both the
+        # "price to beat" and the close are read from it when it is up.
+        self.twap_feed = TwapFeed(cfg.ws_live_url, net.WS_LIVE_HOST) if cfg.twap_feed else None
         # The loop is event-driven: every feed tick, book change and order
         # event sets `_wake`; the loop's sleep is only an idle timeout.
         self._wake = asyncio.Event()
         self._last_tick = 0.0
         self.feed.on_tick = self._wake.set
+        if self.twap_feed is not None:
+            self.twap_feed.on_tick = self._wake.set
         fast_feeds = []
         if cfg.fast_feed:
             fast_feeds.append(BinanceFeed(cfg.fast_feed_url, on_tick=self._wake.set))
@@ -92,16 +99,27 @@ class Bot:
         self.ledger = DayLedger(
             cfg.day_pnl_file.format(mode=cfg.mode) if cfg.mode != "signal" else None
         )
+        # Sniper kill switch: losing snipes in a row, and the UTC day we
+        # stood the sniper down for (someone is faster; the edge is gone).
+        self._snipe_streak = 0
+        self._snipe_stood_down_day: int | None = None
 
     @property
     def day_pnl(self) -> float:
         return self.ledger.today()
+
+    def _snipe_allowed(self) -> bool:
+        if not self.cfg.snipe_enabled or self.cfg.mode == "signal":
+            return False
+        return self._snipe_stood_down_day != int(time.time() // 86400)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         # Background CLOB calls finish on worker threads; wake the loop safely.
         self.executor.set_wake(lambda: loop.call_soon_threadsafe(self._wake.set))
         tasks = [asyncio.create_task(self.feed.run())]
+        if self.twap_feed is not None:
+            tasks.append(asyncio.create_task(self.twap_feed.run()))
         if self.fast is not None:
             tasks.append(asyncio.create_task(self.fast.run()))
         if self.market_stream is not None:
@@ -132,6 +150,17 @@ class Bot:
                  f"hedge≤{self.cfg.maker_hedge_max_price:.2f}")
                 if self.cfg.maker_enabled else "off",
             )
+            if self.cfg.jumps_enabled and self.fast is not None:
+                log.info(
+                    "jump study ON: |Δ| ≥ max($%.0f, %.1fσ) over %.1fs → %s | sniper %s",
+                    self.cfg.jump_min_usd, self.cfg.jump_sigma, self.cfg.jump_window_secs,
+                    self.cfg.jumps_file,
+                    (f"ON {self.cfg.snipe_shares:.0f} sh, edge ≥ {self.cfg.snipe_min_edge:.2f}, "
+                     f"age ≤ {self.cfg.snipe_max_age_ms:.0f}ms, ask {self.cfg.snipe_min_price:.2f}–"
+                     f"{self.cfg.snipe_max_price:.2f}, {'scalp' if self.cfg.snipe_scalp else 'hold'}"
+                     + (f", sim latency {self.cfg.sim_latency_ms:.0f}ms" if self.cfg.mode == "paper" else ""))
+                    if self.cfg.snipe_enabled else "off",
+                )
         try:
             while True:
                 if self._bankroll_exhausted():
@@ -177,6 +206,8 @@ class Bot:
             costs.append(2 * self.cfg.arb_stake_usdc)  # arb needs both legs
         if self.cfg.maker_enabled:
             costs.append(2 * self.cfg.maker_stake_usdc)  # both bids may fill
+        if self.cfg.snipe_enabled:
+            costs.append(self.cfg.snipe_shares * self.cfg.snipe_max_price)
         return min(costs) if costs else self.cfg.stake_usdc
 
     def _bankroll_exhausted(self) -> bool:
@@ -191,7 +222,7 @@ class Bot:
             await asyncio.sleep(2)
             return
 
-        witnessed = self.feed.witnessed_open(market.window_start)
+        witnessed = self._witnessed(market.window_start)
         note = "" if witnessed else " (open not witnessed — arb only)"
         log.info("── window %s | %s%s", market.slug, market.question, note)
         if self.market_stream is not None:
@@ -199,6 +230,7 @@ class Bot:
         position = Position()
         trades = 0
         open_price: float | None = None
+        open_gap = 0.0  # spot at open − price to beat (see below)
         path: list[dict] = []  # price/quote snapshots over the decision zone
         last_path_t: int | None = None
         next_market: Market | None = None
@@ -208,7 +240,20 @@ class Bot:
             MakerPair(self.cfg, self.executor, market, witnessed=witnessed)
             if self.cfg.maker_enabled and self.cfg.mode != "signal" else None
         )
-        if maker is not None:
+        # Jump study (always on with a fast feed) and, gated on it, the sniper.
+        watch = (
+            JumpWatch(
+                market, self.cfg.jumps_file if self.cfg.record else None,
+                self.cfg.jump_window_secs, self.cfg.jump_sigma, self.cfg.jump_min_usd,
+                min_size=self.cfg.snipe_shares,
+            )
+            if self.cfg.jumps_enabled and self.fast is not None else None
+        )
+        sniper = (
+            Sniper(self.cfg, self.executor, market)
+            if watch is not None and self._snipe_allowed() else None
+        )
+        if maker is not None or sniper is not None:
             self._presign(market)  # no-op if the prefetch already did it
         ticks = 0
         ws_reads0, http_reads0 = self.reader.ws_reads, self.reader.http_reads
@@ -221,9 +266,19 @@ class Bot:
                 ticks += 1
 
                 if witnessed and open_price is None:
-                    open_price = self.feed.price_at_or_after(market.window_start)
+                    open_price, src = self._open_ref(market)
                     if open_price is not None:
-                        log.info("window open price ≈ %.1f", open_price)
+                        # The fast feeds measure Δ from *their* print at the
+                        # open; the market measures from the 60s TWAP at the
+                        # open. On a moving tape those differ by tens of
+                        # dollars, which is the whole fair value on a quiet
+                        # window — so every Δ below is shifted by the gap.
+                        spot_open = self.feed.price_at_or_after(market.window_start)
+                        if src == "twap60" and spot_open is not None:
+                            open_gap = spot_open - open_price
+                        log.info("price to beat ≈ %.2f (%s)%s", open_price, src,
+                                 f" | spot at open {spot_open:.2f} (gap {open_gap:+.2f})"
+                                 if spot_open is not None else "")
 
                 secs_left = market.seconds_left
                 sampling = (
@@ -233,7 +288,10 @@ class Bot:
                 # Read both books at most once per tick, shared by arb / maker /
                 # status / path.
                 up_top = down_top = None
-                if self.status.enabled or self.cfg.arb_enabled or sampling or maker is not None:
+                if (
+                    self.status.enabled or self.cfg.arb_enabled or sampling
+                    or maker is not None or watch is not None
+                ):
                     up_top = self.reader.top(market.up_token)
                     down_top = self.reader.top(market.down_token)
 
@@ -260,19 +318,24 @@ class Bot:
                             market.up_token, market.down_token,
                             next_market.up_token, next_market.down_token,
                         ])
-                        if maker is not None:
+                        if maker is not None or sniper is not None:
                             self._presign(next_market)
 
-                if maker is not None:
-                    tick = self.feed.latest
-                    btc = tick.price if tick else None
+                fast_delta = sigma = None
+                if maker is not None or watch is not None:
                     fast_delta = (
                         self.fast.delta_since(market.window_start)
                         if self.fast is not None else None
                     )
+                    if fast_delta is not None:
+                        fast_delta += open_gap  # Δ vs the price to beat, not vs the open print
                     sigma = self.fast.realized_vol(300.0) if self.fast is not None else None
                     if sigma is None:
                         sigma = self.feed.realized_vol(300.0)
+
+                if maker is not None:
+                    tick = self.feed.latest
+                    btc = tick.price if tick else None
                     fills = maker.step(
                         up_top, down_top, btc=btc, open_price=open_price,
                         sigma=sigma, fast_delta=fast_delta,
@@ -304,6 +367,33 @@ class Bot:
                                 maker.mark_hedged(fills)
                             self._record_fills(market, follow, fills, open_price)
 
+                if watch is not None:
+                    jump = self.fast.jump(self.cfg.jump_window_secs)
+                    watch.observe(jump, sigma, fast_delta, up_top, down_top)
+                    if sniper is not None:
+                        fills = sniper.poll(up_top, down_top)
+                        for f in fills:
+                            position.add(f)
+                        if fills:
+                            self._record_fills(
+                                market, sniper.last_signal or Signal("snipe", [], ""),
+                                fills, open_price,
+                            )
+                        shot = sniper.evaluate(
+                            watch.last, jump.age * 1000.0 if jump is not None else None,
+                            up_top, down_top,
+                        )
+                        if shot is not None:
+                            sniper.shoot(shot, watch.last)
+                        scalp = sniper.exit_signal(up_top, down_top)
+                        if scalp is not None:
+                            fills = self._execute(scalp, market)
+                            if fills:
+                                for f in fills:
+                                    position.add(f)
+                                sniper.mark_exited(fills)
+                                self._record_fills(market, scalp, fills, open_price)
+
                 if trades < self.cfg.max_trades_per_window:
                     # Momentum only when we actually saw the open; arb is always safe.
                     signal = self._pick_signal(market, witnessed, up_top, down_top)
@@ -328,7 +418,18 @@ class Bot:
                         market, Signal("maker", [], "harvest on window close"),
                         late, open_price,
                     )
-                self.executor.forget_presigned([market.up_token, market.down_token])
+            if sniper is not None and sniper.pending is not None:
+                # A take sent in the last instant: read its outcome (it is
+                # a FAK, so it is already final on the exchange) before the
+                # position is settled.
+                late = self._drain_take(sniper, market)
+                for f in late:
+                    position.add(f)
+                if late:
+                    self._record_fills(
+                        market, sniper.last_signal or Signal("snipe", [], ""), late, open_price,
+                    )
+            self.executor.forget_presigned([market.up_token, market.down_token])
             elapsed = max(time.monotonic() - t_loop0, 1e-6)
             log.info(
                 "loop: %d ticks in %.0fs (%.3fs/tick) | books %d ws / %d http | fast feed %s",
@@ -337,17 +438,75 @@ class Bot:
                 (self.fast.source or "down") if self.fast is not None else "off",
             )
 
-        self._settle_window(market, position, open_price, witnessed, path)
+        up_won = await self._settle_window(market, position, open_price, witnessed, path)
+        if watch is not None:
+            n = watch.settle(up_won)
+            if n:
+                log.info("jump study: %d jump%s recorded this window", n, "" if n == 1 else "s")
+        if sniper is not None and sniper.fills:
+            self._note_snipe_outcome(sniper, up_won)
+
+    def _drain_take(self, sniper: Sniper, market: Market) -> list[Fill]:
+        """Wait (briefly) for an in-flight take to resolve at window end."""
+        pt = sniper.pending
+        deadline = time.monotonic() + 3.0
+        while pt is not None and not pt.done and time.monotonic() < deadline:
+            fut = pt.future
+            if fut is not None:
+                try:
+                    fut.result(timeout=max(0.0, deadline - time.monotonic()))
+                except Exception:  # noqa: BLE001 - poll_take logs it
+                    pass
+            else:
+                time.sleep(0.02)
+            fills = sniper.poll(
+                self.reader.top(market.up_token), self.reader.top(market.down_token),
+            )
+            if fills:
+                return fills
+        if pt is not None and not pt.done:
+            pt.done = True
+            pt.reason = "unresolved at window close"
+            sniper.pending = None
+            log.warning("snipe %s @ %.2f unresolved at window close", pt.side, pt.price)
+        return []
+
+    def _note_snipe_outcome(self, sniper: Sniper, up_won: bool | None) -> None:
+        """Kill switch: N losing snipes in a row → no more snipes today."""
+        if up_won is None:
+            return
+        pnl = 0.0
+        for f in sniper.fills:
+            won = (f.side == "up") == up_won
+            pnl += f.size * (1.0 if won else 0.0) - f.cost
+        if pnl < -0.005:
+            self._snipe_streak += 1
+        else:
+            self._snipe_streak = 0
+        log.info("snipe window PnL %+.2f (%s) | streak %d losing",
+                 pnl, sniper.summary(), self._snipe_streak)
+        k = self.cfg.snipe_kill_streak
+        if k > 0 and self._snipe_streak >= k:
+            self._snipe_stood_down_day = int(time.time() // 86400)
+            self._snipe_streak = 0
+            log.error("SNIPER STOOD DOWN for today: %d losing snipes in a row — "
+                      "someone is faster than us; the stale quotes we hit are bait", k)
 
     def _presign(self, market: Market) -> None:
-        """Live: sign this market's likely bids off-thread so the first post
-        of the window is a bare HTTP send."""
-        shares, prices = MakerPair.quote_grid(self.cfg, market)
+        """Live: sign this market's likely orders off-thread so the first
+        post of the window is a bare HTTP send. Maker bids and sniper takes
+        use different sizes, so their signed orders never collide."""
         tick = market.tick_size or 0.01
-        for side in ("up", "down"):
-            self.executor.presign_bids(
-                market.token_for(side), side, shares, prices, tick, market.neg_risk,
-            )
+        grids = []
+        if self.cfg.maker_enabled:
+            grids.append(MakerPair.quote_grid(self.cfg, market))
+        if self._snipe_allowed():
+            grids.append(Sniper.quote_grid(self.cfg, market))
+        for shares, prices in grids:
+            for side in ("up", "down"):
+                self.executor.presign_bids(
+                    market.token_for(side), side, shares, prices, tick, market.neg_risk,
+                )
 
     def _tick_secs(self, up_top, down_top) -> float:
         """Idle timeout between iterations: short while both books come off
@@ -443,7 +602,7 @@ class Bot:
             return self._announce_signal(signal, market)
         if signal.kind == "arb":
             return self._execute_arb(signal)
-        if signal.kind == "maker-exit":
+        if signal.kind in ("maker-exit", "snipe-exit"):
             return self._execute_exit(signal)
         side = signal.legs[0].side
         if self._should_log(f"sig:mom:{side}"):
@@ -589,15 +748,50 @@ class Bot:
                         len(fills), len(signal.legs))
         return fills
 
-    def _settle_window(
+    # ------------------------------------------------------------ resolution
+    #
+    # The market resolves on Chainlink's 60s TWAP *stream*: "Up" iff its
+    # value at the window end ≥ its value at the open (the "price to beat").
+    # We read both off that stream when it is up and fall back to the spot
+    # stream (first tick after the open / our own 60s average) when not.
+
+    def _twap_alive(self) -> bool:
+        return self.twap_feed is not None and self.twap_feed.latest is not None
+
+    def _witnessed(self, window_start: float) -> bool:
+        if self._twap_alive():
+            return self.twap_feed.witnessed_open(window_start)
+        return self.feed.witnessed_open(window_start)
+
+    def _open_ref(self, market: Market) -> tuple[float | None, str]:
+        """(price to beat, source). From the TWAP stream, once the update
+        stamped at the open has landed (they arrive ~3s late); spot otherwise."""
+        if self._twap_alive():
+            tf = self.twap_feed
+            if tf.latest.src_ts < market.window_start and market.seconds_in < 10:
+                return None, "twap60"  # the tick stamped at the open is still in flight
+            v = tf.value_at(market.window_start)
+            if v is not None:
+                return v, "twap60"
+        return self.feed.price_at_or_after(market.window_start), "spot"
+
+    async def _close_ref(self, market: Market) -> tuple[float | None, str]:
+        if self._twap_alive():
+            tf = self.twap_feed
+            await tf.wait_for(market.window_end, timeout=6.0)
+            v = tf.value_at(market.window_end)
+            if v is not None:
+                return v, "twap60"
+        close = self.feed.twap(market.window_end - self.cfg.twap_secs, market.window_end)
+        if close is None and self.feed.latest:
+            close = self.feed.latest.price
+        return close, "spot"
+
+    async def _settle_window(
         self, market: Market, position: Position, open_price: float | None,
         witnessed: bool, path: list[dict] | None = None,
-    ) -> None:
-        # The market settles on the Chainlink TWAP over the final `twap_secs`,
-        # not the last tick.
-        close_price = self.feed.twap(market.window_end - self.cfg.twap_secs, market.window_end)
-        if close_price is None and self.feed.latest:
-            close_price = self.feed.latest.price
+    ) -> bool | None:
+        close_price, settle_src = await self._close_ref(market)
         # Outcome is only trustworthy when we witnessed the true open.
         up_won = (
             (close_price >= open_price)
@@ -642,15 +836,20 @@ class Bot:
             self._credit_bankroll(position.cost + window_pnl)
             prefix = "if you entered, " if self.cfg.mode == "signal" else ""
             log.info(
-                "SETTLE %s won | open=%.1f closeTWAP=%.1f | %swindow PnL=%+.2f | session=%+.2f | bankroll=%s",
-                "UP" if up_won else "DOWN", open_price, close_price, prefix,
+                "SETTLE %s won | beat=%.2f close=%.2f (%s) | %swindow PnL=%+.2f | session=%+.2f | bankroll=%s",
+                "UP" if up_won else "DOWN", open_price, close_price, settle_src, prefix,
                 window_pnl, self.session_pnl,
                 f"${self.executor.bankroll:.2f}" if self.executor.bankroll is not None else "∞",
             )
+        if not position.fills and up_won is not None:
+            log.info("outcome %s | beat=%.2f close=%.2f (%s)",
+                     "UP" if up_won else "DOWN", open_price, close_price, settle_src)
 
         self._record_window(
-            market, position, witnessed, open_price, close_price, up_won, window_pnl, path or []
+            market, position, witnessed, open_price, close_price, up_won, window_pnl, path or [],
+            settle_src,
         )
+        return up_won
 
     def _record_fills(self, market: Market, signal: Signal, fills, open_price) -> None:
         if not self.recorder.enabled:
@@ -679,7 +878,7 @@ class Bot:
 
     def _record_window(
         self, market: Market, position: Position, witnessed: bool,
-        open_price, close_price, up_won, window_pnl, path,
+        open_price, close_price, up_won, window_pnl, path, settle_src: str = "spot",
     ) -> None:
         if not self.recorder.enabled:
             return
@@ -691,6 +890,9 @@ class Bot:
             open_price=open_price,
             close_price=close_price,
             up_won=up_won,
+            # "twap60" = both ends read off the Chainlink 60s TWAP stream the
+            # market resolves on; "spot" = older spot-stream approximation.
+            settle_src=settle_src,
             traded=bool(position.fills),
             n_fills=len(position.fills),
             cost=round(position.cost, 4),

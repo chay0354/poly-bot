@@ -1,5 +1,6 @@
 """Offline unit tests for strategy + settlement logic (no network)."""
 
+import asyncio
 import io
 import json
 import logging
@@ -378,7 +379,8 @@ def test_settlement_records_window(tmp_path):
         {"t": 30.0, "btc": 63430.0, "up": 0.90, "dn": 0.11},
         {"t": 10.0, "btc": 63435.0, "up": 0.95, "dn": 0.06},
     ]
-    bot._settle_window(market, pos, open_price=63410.1, witnessed=True, path=sampled_path)
+    bot.twap_feed = None
+    asyncio.run(bot._settle_window(market, pos, open_price=63410.1, witnessed=True, path=sampled_path))
     bot.recorder.close()
 
     records = [json.loads(line) for line in (tmp_path / "trades.jsonl").read_text().splitlines()]
@@ -497,7 +499,8 @@ def test_bankroll_credited_on_settlement():
 
     market = make_market()
     market.window_start = 1
-    bot._settle_window(market, pos, open_price=100.0, witnessed=True)
+    bot.twap_feed = None
+    asyncio.run(bot._settle_window(market, pos, open_price=100.0, witnessed=True))
     # UP won (close 101 >= open 100): 10 shares pay $10 -> bankroll 95 + 10 = 105.
     assert bot.executor.bankroll == 105.0
     assert round(bot.session_pnl, 2) == 5.0

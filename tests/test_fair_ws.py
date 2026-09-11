@@ -1,6 +1,7 @@
 """Offline tests: fair-value quoting, depth-walking exits, CLOB WebSocket
 ingestion, and the persisted daily ledger."""
 
+import asyncio
 import json
 import time
 
@@ -389,13 +390,14 @@ def test_live_window_estimate_feeds_the_ledger():
                               "twap": lambda self, a, b: 99.0})()
     m = _mk()
     # Naked Up leg held to a Down resolution: −cost.
+    bot.twap_feed = None
     pos = Position()
     pos.add(Fill("UP", "up", 0.46, 5.0, 2.30, paper=False, maker=True))
-    bot._settle_window(m, pos, open_price=100.0, witnessed=True)
+    asyncio.run(bot._settle_window(m, pos, open_price=100.0, witnessed=True))
     assert round(bot.ledger.today(), 2) == -2.30
     # A locked pair: +$1/sh − cost, whichever way it resolves.
     pos = Position()
     pos.add(Fill("UP", "up", 0.46, 5.0, 2.30, paper=False, maker=True))
     pos.add(Fill("DOWN", "down", 0.46, 5.0, 2.30, paper=False, maker=True))
-    bot._settle_window(m, pos, open_price=100.0, witnessed=True)
+    asyncio.run(bot._settle_window(m, pos, open_price=100.0, witnessed=True))
     assert round(bot.ledger.today(), 2) == round(-2.30 + (5.0 - 4.60), 2)

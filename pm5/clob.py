@@ -26,6 +26,15 @@ class BookTop:
     asks: list[tuple[float, float]] = field(default_factory=list)
     source: str = "http"
 
+    def offered_at(self, price: float) -> float:
+        """Shares offered at or below `price` — what a marketable buy capped
+        at `price` can take. Top level only when depth is unknown."""
+        if self.best_ask is None:
+            return 0.0
+        if self.asks:
+            return sum(size for p, size in self.asks if p <= price + 1e-9)
+        return self.best_ask_size if self.best_ask <= price + 1e-9 else 0.0
+
     def sell_plan(self, shares: float, floor: float) -> tuple[float, float] | None:
         """(worst price, fillable shares) for selling `shares` into bids ≥ floor.
 
@@ -94,6 +103,29 @@ class RestingOrder:
     def live(self) -> bool:
         """On the book (or about to be) and not being taken down."""
         return not self.done and not self.cancelling
+
+
+@dataclass
+class PendingTake:
+    """A marketable (FAK) buy in flight — real or simulated.
+
+    Paper: the order "lands" `deadline` after it was sent; it fills only if
+    the offered size at ≤ `price` was there the whole way. A quote that
+    vanishes first is a lost race, not a fill — the honest answer to the
+    only question the sniper asks.
+    """
+
+    token_id: str
+    side: str
+    price: float
+    shares: float
+    paper: bool
+    sent_at: float
+    deadline: float = 0.0
+    future: object | None = field(default=None, repr=False, compare=False)
+    done: bool = False
+    fill: Fill | None = None
+    reason: str | None = None  # why it did not fill, once done
 
 
 def taker_fee_usdc(shares: float, price: float, rate: float) -> float:
@@ -290,6 +322,68 @@ class Executor:
             return Fill(token_id, side, price, -qty, cost, paper=True)
 
         return self._live.sell(token_id, side, worst, qty)
+
+    # ------------------------------------------------------------------ taker
+
+    def take(
+        self, token_id: str, side: str, price: float, shares: float,
+        tick_size: float, neg_risk: bool,
+    ) -> PendingTake | None:
+        """Send a FAK buy of `shares` at ≤ `price` and return at once.
+
+        The fill (or the miss) is read by `poll_take` on later ticks. Live
+        posts a pre-signed order off-thread; paper starts a simulated
+        round trip of `sim_latency_ms` during which the quote must survive.
+        """
+        if shares <= 0 or price <= 0:
+            self.last_skip = "nothing to take"
+            return None
+        cost = round(shares * price, 4)
+        if self.bankroll is not None and self.bankroll < cost:
+            self.last_skip = f"insufficient bankroll (${self.bankroll:.2f})"
+            return None
+        self.last_skip = None
+        now = time.monotonic()
+        if self._live is None:
+            log.info("[PAPER] TAKE %s %.2f sh @ ≤%.2f sent (lands in %.0fms)",
+                     side, shares, price, self.cfg.sim_latency_ms)
+            return PendingTake(token_id, side, price, shares, paper=True, sent_at=now,
+                               deadline=now + self.cfg.sim_latency_ms / 1000.0)
+        return self._live.take(token_id, side, price, shares, tick_size, neg_risk)
+
+    def poll_take(self, pt: PendingTake, top: BookTop | None = None) -> Fill | None:
+        """Resolve an in-flight take. Returns the Fill once, then None."""
+        if pt.done:
+            return None
+        if not pt.paper:
+            fill = self._live.poll_take(pt)
+            if pt.done and fill is None:
+                self.last_skip = pt.reason
+            return fill
+        if top is None:
+            top = self.reader.top(pt.token_id)
+        now = time.monotonic()
+        avail = top.offered_at(pt.price)
+        if avail < pt.shares - 1e-9:
+            pt.done = True
+            pt.reason = (f"quote gone after {(now - pt.sent_at) * 1000:.0f}ms "
+                         f"({avail:.0f} sh ≤ {pt.price:.2f} < {pt.shares:.0f})")
+            self.last_skip = pt.reason
+            log.info("[PAPER] TAKE %s missed: %s", pt.side, pt.reason)
+            return None
+        if now < pt.deadline:
+            return None
+        cost = round(pt.shares * pt.price, 4)
+        fee = taker_fee_usdc(pt.shares, pt.price, self.cfg.taker_fee_rate)
+        net_shares = round(pt.shares - fee / pt.price, 2)
+        if self.bankroll is not None:
+            self.bankroll -= cost
+        pt.done = True
+        pt.fill = Fill(pt.token_id, pt.side, pt.price, net_shares, cost, paper=True)
+        log.info("[PAPER] TAKE %s %.2f sh @ %.3f = $%.2f (fee $%.3f) filled after %.0fms | bankroll $%s",
+                 pt.side, net_shares, pt.price, cost, fee, (now - pt.sent_at) * 1000,
+                 f"{self.bankroll:.2f}" if self.bankroll is not None else "∞")
+        return pt.fill
 
     # ------------------------------------------------------------------ maker
 

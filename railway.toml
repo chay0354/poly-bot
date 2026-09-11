@@ -1,5 +1,16 @@
 # Railway worker: long-running python loop (not a web app / not Vercel).
 # Set PM_* variables in the Railway dashboard. Never put PM_PRIVATE_KEY in git.
+#
+# Sniper phase (Sep 2026) — the dashboard variables must be:
+#   PM_MODE=paper              until the paper run (≥300 windows) is net > 0
+#   PM_MAKER=false             the maker lost on every 10 Sep session; off
+#   PM_MOMENTUM=false          −EV per analysis-2026-06-12
+#   PM_ARB=false
+#   PM_JUMPS=true              jump study always on (data/jumps.jsonl)
+#   PM_SNIPE=true  PM_SNIPE_SHARES=5  PM_SNIPE_MIN_EDGE=0.06
+#   PM_DAILY_LOSS_LIMIT=3
+# Railway's config-as-code has no variables section, so this is a checklist,
+# not enforcement. `run.py` logs the effective flags at start — read them.
 
 [build]
 builder = "DOCKERFILE"

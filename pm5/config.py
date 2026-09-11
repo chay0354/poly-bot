@@ -45,6 +45,11 @@ class Config:
     clob_url: str = "https://clob.polymarket.com"
     gamma_url: str = "https://gamma-api.polymarket.com"
     ws_live_url: str = "wss://ws-live-data.polymarket.com"
+    # Also stream Chainlink's 60s BTC/USD TWAP (`crypto_prices_twap_sixty`),
+    # the stream the market resolves on, and read the price to beat and the
+    # close from it. Off → the spot-stream approximation (mislabels quiet
+    # windows: 77 of 653 on the 8–10 Sep data).
+    twap_feed: bool = field(default_factory=lambda: _b("PM_TWAP_FEED", True))
     # Binance trade stream as an early warning for the maker's defensive
     # cancel (market makers price off it and it leads Chainlink by seconds).
     # Settlement and the open stay on Chainlink. Falls back silently if down.
@@ -187,6 +192,46 @@ class Config:
     # A thin top level used to block the sale entirely and the leg was then
     # carried to a $0 resolution (two −$5 windows on 10 Sep).
     maker_exit_slip: float = field(default_factory=lambda: _f("PM_MAKER_EXIT_SLIP", 0.03))
+
+    # --- Jump study + sniper ---
+    # Record every short-window BTC jump and how long the stale quote on the
+    # side that got more valuable survived (data/jumps.jsonl). Zero orders.
+    # This is the measurement the sniper is gated on.
+    jumps_enabled: bool = field(default_factory=lambda: _b("PM_JUMPS", True))
+    jumps_file: str = field(default_factory=lambda: os.getenv("PM_JUMPS_FILE", "data/jumps.jsonl"))
+    # A jump = move over the last WINDOW seconds ≥ max(MIN_USD, SIGMA × σ of
+    # that window implied by the realized 5-min range).
+    jump_window_secs: float = field(default_factory=lambda: _f("PM_JUMP_WINDOW", 1.0))
+    jump_sigma: float = field(default_factory=lambda: _f("PM_JUMP_SIGMA", 3.0))
+    jump_min_usd: float = field(default_factory=lambda: _f("PM_JUMP_MIN_USD", 10.0))
+    # Sniper: after a jump, FAK-buy the side whose ask is still at the old
+    # price while fair − ask ≥ MIN_EDGE. Off by default; turn on only after the
+    # jump study says stale quotes outlive our round trip.
+    snipe_enabled: bool = field(default_factory=lambda: _b("PM_SNIPE", False))
+    snipe_shares: float = field(default_factory=lambda: _f("PM_SNIPE_SHARES", 5.0))
+    snipe_min_edge: float = field(default_factory=lambda: _f("PM_SNIPE_MIN_EDGE", 0.06))
+    # The jump must be this fresh (ms since the print) — older and the book
+    # has had time to reprice; whatever is still offered is offered on purpose.
+    snipe_max_age_ms: float = field(default_factory=lambda: _f("PM_SNIPE_MAX_AGE_MS", 800.0))
+    # Price band for the ask we hit: dust under MIN is unfillable noise,
+    # above MAX the fee and the downside eat the edge.
+    snipe_min_price: float = field(default_factory=lambda: _f("PM_SNIPE_MIN_PRICE", 0.10))
+    snipe_max_price: float = field(default_factory=lambda: _f("PM_SNIPE_MAX_PRICE", 0.85))
+    # Only inside this part of the window: not while the book is still being
+    # built, not in the final seconds.
+    snipe_min_left: float = field(default_factory=lambda: _f("PM_SNIPE_MIN_LEFT", 20.0))
+    snipe_max_left: float = field(default_factory=lambda: _f("PM_SNIPE_MAX_LEFT", 280.0))
+    snipe_per_window: int = field(default_factory=lambda: _i("PM_SNIPE_PER_WINDOW", 1))
+    # Hold to resolution (default) or sell back once the bid is TAKE above
+    # our entry (pays the taker fee twice, less variance).
+    snipe_scalp: bool = field(default_factory=lambda: _b("PM_SNIPE_SCALP", False))
+    snipe_take: float = field(default_factory=lambda: _f("PM_SNIPE_TAKE", 0.04))
+    # This many losing snipes in a row → no more snipes today (someone is
+    # faster than us; the edge is gone). 0 = off.
+    snipe_kill_streak: int = field(default_factory=lambda: _i("PM_SNIPE_KILL_STREAK", 5))
+    # Paper: a simulated take lands this long after it is sent and fills only
+    # if the quote survived the whole way. Set it to what live shows.
+    sim_latency_ms: float = field(default_factory=lambda: _f("PM_SIM_LATENCY_MS", 150.0))
 
     # --- Fees ---
     # Polymarket crypto taker fee: shares × rate × p × (1-p). Makers pay 0.

@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -33,6 +34,23 @@ import websockets
 from .pricefeed import Tick
 
 log = logging.getLogger("pm5.fastfeed")
+
+
+@dataclass
+class Jump:
+    """The move on one venue over a short trailing window (our clock)."""
+
+    venue: str
+    delta: float  # USD, end − start
+    start_price: float
+    end_price: float
+    start_ts: float  # recv_ts of the print that set the reference price
+    end_ts: float  # recv_ts of the latest print
+
+    @property
+    def age(self) -> float:
+        """Seconds since the latest print landed here."""
+        return time.time() - self.end_ts
 
 
 def geo_blocked(err: object) -> bool:
@@ -179,6 +197,24 @@ class TradeFeed:
             return None
         return hi - lo
 
+    def jump(self, window_secs: float) -> Jump | None:
+        """Move over the last `window_secs` of *our* clock: latest print vs the
+        price that prevailed `window_secs` ago (the last print at or before
+        that instant). None when the history does not reach back that far or
+        the stream is stale. Same venue both ends, like every delta here."""
+        if not self.fresh or len(self._history) < 2:
+            return None
+        end = self.latest
+        cutoff = end.recv_ts - window_secs
+        ref: Tick | None = None
+        for t in reversed(self._history):
+            if t.recv_ts <= cutoff:
+                ref = t
+                break
+        if ref is None:
+            return None
+        return Jump(self.name, end.price - ref.price, ref.price, end.price, ref.recv_ts, end.recv_ts)
+
 
 class BinanceFeed(TradeFeed):
     """BTCUSDT aggTrade stream (subscription is in the URL)."""
@@ -284,3 +320,12 @@ class FastFeeds:
         # venue that actually moved, and a quieter venue would understate σ.
         vols = [v for v in (f.realized_vol(secs) for f in self.feeds if f.fresh) if v is not None]
         return max(vols) if vols else None
+
+    def jump(self, window_secs: float) -> Jump | None:
+        """The short-window move on the venue that printed most recently
+        (the first mover is the one the stale quotes have not seen yet)."""
+        for f in self._ranked():
+            j = f.jump(window_secs)
+            if j is not None:
+                return j
+        return None
