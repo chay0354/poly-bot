@@ -258,7 +258,17 @@ class MakerPair:
             return None
         return fair_up(delta, sigma, left)
 
-    def _fair_side(self, side: str) -> float:
+    # A timer exit into a gapped bid may wait up to this many exit windows
+    # for the book to fill back in (or the pair to close) before selling anyway.
+    EXIT_GAP_PATIENCE = 2.0
+
+    def _worth(self, side: str, tops: dict[str, BookTop | None] | None = None) -> float | None:
+        """Best estimate of P(side wins) without our own bids in it."""
+        if self._fair_up is not None:
+            return self._fair_side(side, tops)
+        return self._book_prob(side, tops)
+
+    def _fair_side(self, side: str, tops: dict[str, BookTop | None] | None = None) -> float:
         """P(side wins): the tape model, capped by what the book itself says.
 
         The book's asks bound the probability without our own bids polluting
@@ -270,11 +280,12 @@ class MakerPair:
         """
         assert self._fair_up is not None
         model = self._fair_up if side == "up" else 1.0 - self._fair_up
-        book = self._book_prob(side)
+        book = self._book_prob(side, tops)
         return model if book is None else min(model, book)
 
-    def _book_prob(self, side: str) -> float | None:
-        tops = self._tops
+    def _book_prob(self, side: str, tops: dict[str, BookTop | None] | None = None) -> float | None:
+        if tops is None:
+            tops = self._tops
         mine = tops.get(side)
         other = tops.get("down" if side == "up" else "up")
         a_s = mine.best_ask if mine is not None else None
@@ -518,10 +529,13 @@ class MakerPair:
         """Get out of a stuck naked leg.
 
         Caller must try complete_pair first (that is the ≤ $1.00 lock). We
-        fire when the timer runs out *or* our side's bid has already fallen
-        `maker_stop_ticks` under the fill — the market decided, waiting only
-        makes the bid worse (17:00: 0.42 → 0.38 in 20s). Then take the
-        cheaper of selling at the bid and buying the other side as a taker.
+        fire when the timer runs out *or* the market decided against the leg:
+        our side's bid AND what the leg is worth (fair capped by the asks)
+        are both `maker_stop_ticks` under the fill — waiting only makes the
+        bid worse (17:00: 0.42 → 0.38 in 20s). The bid alone is not a
+        decision: after our fill the next bid is naturally a few ticks lower.
+        Then take the cheaper of selling at the bid and buying the other side
+        as a taker.
         """
         if self.hedged or self.exited or self.cfg.maker_exit_secs <= 0:
             return None
@@ -537,12 +551,25 @@ class MakerPair:
         bid = top.best_bid
         age = self._clock() - self._naked_since
         stop = self.cfg.maker_stop_ticks
-        decided = stop > 0 and bid <= avg - stop + 1e-9
+        tops = {"up": up_top, "down": down_top}
+        # What the leg is worth: the tape model capped by the asks, or the
+        # asks alone before σ is known. Never the bid — we WERE the best bid,
+        # so the moment we fill the next bid sits several ticks lower and the
+        # old "bid ≤ fill − stop" read that gap as the market deciding
+        # (07:30: Down hit 0.46 at T+6s, Δ +1.7, sold 0.34 two seconds later;
+        # eight of today's ten exits were that, not a move).
+        worth = self._worth(side, tops)
+        bid_under = stop > 0 and bid <= avg - stop + 1e-9
+        decided = bid_under and (worth is None or worth <= avg - stop + 1e-9)
         if age < self.cfg.maker_exit_secs and not decided:
             return None
         if bid < self.cfg.maker_exit_min_bid:
             return None
-        why = f"bid {bid:.2f} ≤ fill {avg:.2f}−{stop:.2f}" if decided else f"after {age:.0f}s"
+        why = (
+            f"bid {bid:.2f}, worth {worth:.2f} ≤ fill {avg:.2f}−{stop:.2f}" if decided and worth is not None
+            else f"bid {bid:.2f} ≤ fill {avg:.2f}−{stop:.2f}" if decided
+            else f"after {age:.0f}s"
+        )
         qty = self.naked_shares
 
         # Two ways out; take the cheaper. Buying the other side locks $1 per
@@ -580,6 +607,17 @@ class MakerPair:
                         f"{ask:.2f} + fee {fee:.3f} = {all_in:.3f}, beats selling @ {bid:.2f}"
                     ),
                 )
+        if (
+            not decided
+            and worth is not None
+            and bid < worth - max(stop, self.cfg.maker_exit_slip) - 1e-9
+            and age < self.cfg.maker_exit_secs * self.EXIT_GAP_PATIENCE
+        ):
+            # Timer fired but the bid is gapped under what the leg is worth:
+            # selling here pays the gap, not the market. Keep the leftover
+            # pair bid working a little longer; the hard cap below still
+            # guarantees we do not carry a naked leg to resolution.
+            return None
         floor = round(max(bid - self.cfg.maker_exit_slip, self.cfg.maker_exit_min_bid), 2)
         return Signal(
             kind="maker-exit",

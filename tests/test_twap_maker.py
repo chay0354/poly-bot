@@ -627,6 +627,75 @@ def test_maker_exit_stops_early_when_market_decides_against_leg():
     assert sig.legs[0].max_price == 0.42 and sig.legs[0].shares == 10.87
 
 
+def test_maker_stop_ignores_the_gap_our_own_fill_left():
+    """10 Sep 07:30: Down hit 0.46 at T+6s while BTC Δ was +1.7. We had been
+    the best bid, so the next bid was 0.37; the old stop read that as the
+    market deciding and sold 0.34 two seconds later. Asks still 0.50/0.50
+    say the leg is worth ~0.50 — hold and let the pair bid work."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_exit_secs = 30
+    cfg.maker_stop_ticks = 0.04
+    now = {"t": 1000.0}
+    mk._clock = lambda: now["t"]
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.56), _book(0.46))  # Down hit @ 0.46
+    now["t"] += 2
+    # Up ask 0.64 keeps the pair route out of reach (0.46 + 0.64 + fee > 1.09).
+    up_dear = _book(0.64, bid=0.62)
+    gapped = _book(0.50, bid=0.37)  # Down worth (0.50 + 0.36)/2 = 0.43
+    assert mk.exit_signal(up_dear, gapped) is None
+    # Timer fires into the same gapped book: still wait (bounded).
+    now["t"] += 29
+    assert mk.exit_signal(up_dear, gapped) is None
+    # Book fills back in near worth → the timer exit sells at the bid.
+    sig = mk.exit_signal(_book(0.60, bid=0.58), _book(0.50, bid=0.47))
+    assert sig is not None and sig.kind == "maker-exit" and sig.legs[0].max_price == 0.47
+    # Or the patience runs out: sell anyway rather than ride to resolution.
+    now["t"] += 30
+    sig = mk.exit_signal(up_dear, gapped)
+    assert sig is not None and sig.kind == "maker-exit" and sig.legs[0].max_price == 0.37
+
+
+def test_maker_stop_fires_when_asks_confirm_the_move():
+    """A real move: both the bid and the asks say the leg is worth ≤ fill − stop."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_exit_secs = 30
+    cfg.maker_stop_ticks = 0.04
+    now = {"t": 1000.0}
+    mk._clock = lambda: now["t"]
+    mk.step(_book(0.52), _book(0.52))
+    mk.step(_book(0.56), _book(0.46))  # Down hit @ 0.46
+    now["t"] += 2
+    # Down asks 0.42 / Up asks 0.60 → Down worth (0.42 + 0.40)/2 = 0.41 ≤ 0.42.
+    sig = mk.exit_signal(_book(0.60, bid=0.58), _book(0.42, bid=0.40))
+    assert sig is not None and sig.kind == "maker-exit"
+    assert sig.legs[0].side == "down" and sig.legs[0].max_price == 0.40
+    assert "worth 0.41" in sig.reason
+
+
+def test_maker_stop_uses_fair_when_the_tape_is_known():
+    """Fast feed says Down is worth 0.30 after a +$40 move; the asks lag at
+    0.48. Bid 0.40 ≤ 0.42 and worth 0.30 ≤ 0.42 → decided, sell."""
+    cfg, ex, m, mk = _maker()
+    cfg.maker_exit_secs = 30
+    cfg.maker_stop_ticks = 0.04
+    now = {"t": 1000.0}
+    mk._clock = lambda: now["t"]
+    mk.step(_book(0.52), _book(0.52), sigma=150.0, fast_delta=0.0)
+    mk.step(_book(0.56), _book(0.46), sigma=150.0, fast_delta=0.0)  # Down hit @ 0.46
+    now["t"] += 2
+    mk.step(_book(0.56, bid=0.52), _book(0.48, bid=0.40), sigma=150.0, fast_delta=40.0)
+    assert mk._fair_up is not None and mk._fair_up > 0.6
+    # Decided at T+2s (not the 30s timer). The exit takes the cheaper route,
+    # here the Up pair at 0.56 (1.037) over selling Down at 0.40 (−0.06/sh).
+    sig = mk.exit_signal(_book(0.56, bid=0.52), _book(0.48, bid=0.40))
+    assert sig is not None and sig.kind in ("maker-exit", "maker-pair")
+    assert "worth 0.3" in sig.reason and "≤ fill 0.46−0.04" in sig.reason
+    # Asks alone (0.48 / 0.56 → 0.46) would NOT have called it decided.
+    mk._fair_up = None
+    assert mk.exit_signal(_book(0.56, bid=0.52), _book(0.48, bid=0.40)) is None
+
+
 def test_maker_exit_prefers_cheaper_pair_completion():
     cfg, ex, m, mk = _maker()
     cfg.maker_exit_secs = 30
