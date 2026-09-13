@@ -54,6 +54,39 @@ def test_eth_preset_rewires_feeds():
     assert m.browser_url.startswith("https://polymarket.com/event/btc-updown-5m-")
 
 
+def test_official_up_won_reads_gamma_prices():
+    from pm5.markets import MarketDiscovery
+
+    class _R:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class _C:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def get(self, url, params=None):
+            r = _R()
+            r.payload = self._payload
+            return r
+
+    payload = [{
+        "markets": [{
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '["1", "0"]',
+        }],
+    }]
+    d = MarketDiscovery("https://gamma.example", client=_C(payload))
+    assert d.official_up_won("btc-updown-5m-1") is True
+    payload[0]["markets"][0]["outcomePrices"] = '["0", "1"]'
+    assert d.official_up_won("btc-updown-5m-1") is False
+    payload[0]["markets"][0]["outcomePrices"] = '["0.55", "0.45"]'
+    assert d.official_up_won("btc-updown-5m-1") is None
+
+
 def test_window_alignment():
     assert current_window_start(1781263205) == 1781263200
     assert current_window_start(1781263499) == 1781263200

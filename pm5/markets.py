@@ -94,3 +94,40 @@ class MarketDiscovery:
 
     def current(self) -> Market | None:
         return self.fetch(current_window_start())
+
+    def official_up_won(self, slug: str) -> bool | None:
+        """Polymarket's resolved winner, not our TWAP read.
+
+        11:30 and 11:40 ET on 13 Sep: our close was Down, Gamma paid Up,
+        and live CRM booked −$20 on a winning Up fill. Use this once the
+        book has snapped to ~0/1 (or Gamma marked it resolved).
+        """
+        try:
+            r = self._client.get(f"{self._url}/events", params={"slug": slug})
+            r.raise_for_status()
+            data = r.json()
+        except (httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not data:
+            return None
+        markets = (data[0] or {}).get("markets") or []
+        if not markets:
+            return None
+        m = markets[0]
+        raw = m.get("outcomePrices")
+        try:
+            prices = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+            outcomes = json.loads(m["outcomes"]) if isinstance(m.get("outcomes"), str) else (m.get("outcomes") or [])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if len(prices) < 2 or len(outcomes) < 2:
+            return None
+        by = {str(o).lower(): float(p) for o, p in zip(outcomes, prices)}
+        up_p, dn_p = by.get("up"), by.get("down")
+        if up_p is None or dn_p is None:
+            up_p, dn_p = float(prices[0]), float(prices[1])
+        if up_p >= 0.92 and dn_p <= 0.08:
+            return True
+        if dn_p >= 0.92 and up_p <= 0.08:
+            return False
+        return None

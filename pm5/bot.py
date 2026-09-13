@@ -807,6 +807,17 @@ class Bot:
     # We read both off that stream when it is up and fall back to the spot
     # stream (first tick after the open / our own 60s average) when not.
 
+    async def _official_outcome(self, market: Market) -> bool | None:
+        """Poll Gamma until the book snaps to a winner (or 15s)."""
+        deadline = time.monotonic() + 15.0
+        last: bool | None = None
+        while time.monotonic() < deadline:
+            last = self.discovery.official_up_won(market.slug)
+            if last is not None:
+                return last
+            await asyncio.sleep(1.5)
+        return last
+
     def _twap_alive(self) -> bool:
         return self.twap_feed is not None and self.twap_feed.latest is not None
 
@@ -858,6 +869,19 @@ class Bot:
             if (witnessed and open_price is not None and close_price is not None)
             else None
         )
+        # Live CRM / daily limit must match what Polymarket actually paid.
+        # Our TWAP read flipped 11:30 and 11:40 ET (13 Sep) vs Gamma.
+        official = await self._official_outcome(market)
+        if official is not None:
+            if up_won is not None and official != up_won:
+                log.warning(
+                    "TWAP said %s, Gamma paid %s; using Gamma (%s)",
+                    "UP" if up_won else "DOWN",
+                    "UP" if official else "DOWN",
+                    market.slug,
+                )
+            up_won = official
+            settle_src = f"{settle_src}+gamma"
         window_pnl: float | None = None
         is_live = any(not f.paper for f in position.fills)
 
