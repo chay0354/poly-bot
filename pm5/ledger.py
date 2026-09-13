@@ -58,6 +58,14 @@ class DayLedger:
         self._roll()
         return self.pnl
 
+    def replace(self, pnl: float, windows: int) -> float:
+        """Overwrite today's total after a Gamma/CRM reconcile."""
+        self._roll()
+        self.pnl = float(pnl)
+        self.windows = int(windows)
+        self._save()
+        return self.pnl
+
     def _save(self) -> None:
         if self._path is None:
             return

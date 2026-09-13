@@ -355,6 +355,81 @@ def test_day_ledger_persists_and_rolls(tmp_path, monkeypatch):
     assert json.loads(path.read_text())["date"] == "2099-01-01"
 
 
+def test_day_ledger_replace_overwrites_today(tmp_path):
+    led = DayLedger(str(tmp_path / "day.json"))
+    led.add(-53.83)
+    led.replace(2.06, 1)
+    assert round(led.today(), 2) == 2.06 and led.windows == 1
+    again = DayLedger(str(tmp_path / "day.json"))
+    assert round(again.today(), 2) == 2.06
+
+
+def test_stale_spot_held_leg_does_not_count_until_gamma():
+    from pm5.bot import Bot, Position
+    from pm5.pricefeed import Tick, TwapFeed
+
+    cfg = Config()
+    cfg.mode = "live"
+    bot = Bot.__new__(Bot)
+    bot.cfg = cfg
+    bot.session_pnl = 0.0
+    bot.ledger = DayLedger(None)
+    bot.recorder = type("R", (), {"enabled": False})()
+    bot.executor = type("E", (), {"bankroll": None})()
+    async def _no_gamma(_m):
+        return None
+    bot._official_outcome = _no_gamma
+    m = _mk(seconds_in=300)
+    ws, we = m.window_start, m.window_end
+    bot.feed = type("F", (), {
+        "latest": Tick(price=77002.24, src_ts=we, recv_ts=we),
+        "twap": lambda self, a, b: 77002.24,
+    })()
+    tf = TwapFeed("wss://x", "x")
+    tf._ingest(json.dumps({
+        "topic": "crypto_prices_twap_sixty", "type": "update",
+        "payload": {"symbol": "btc/usd", "value": 77051.40,
+                    "timestamp": int(ws * 1000), "window_s": 60},
+    }))
+    bot.twap_feed = tf
+    pos = Position()
+    pos.add(Fill("UP", "up", 0.90, 22.06, 20.0, paper=False))
+    asyncio.run(bot._settle_window(m, pos, open_price=77051.40, witnessed=True))
+    assert round(bot.ledger.today(), 4) == 0.0
+
+
+def test_reconcile_lifts_false_loss_limit():
+    from pm5.bot import Bot
+
+    cfg = Config()
+    cfg.mode = "live"
+    cfg.daily_loss_limit_usdc = 40.0
+    bot = Bot.__new__(Bot)
+    bot.cfg = cfg
+    bot.ledger = DayLedger(None)
+    bot.ledger.add(-53.83)
+    bot.discovery = type("D", (), {"official_up_won": lambda self, slug: True})()
+
+    class _Sb:
+        enabled = True
+
+        def live_day_windows(self, day):
+            return [{
+                "window_slug": "btc-updown-5m-1789315200",
+                "up_shares": 22.06,
+                "down_shares": 0.0,
+                "cost": 20.0,
+                "up_won": True,
+                "estimated_pnl": 2.06,
+            }]
+
+    bot.recorder = type("R", (), {"_sb": _Sb()})()
+    assert bot._loss_limit_hit()
+    bot._reconcile_day_ledger()
+    assert round(bot.day_pnl, 2) == 2.06
+    assert not bot._loss_limit_hit()
+
+
 def test_loss_limit_uses_persisted_ledger(tmp_path):
     from pm5.bot import Bot
 

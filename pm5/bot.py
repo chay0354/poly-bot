@@ -33,7 +33,7 @@ from .recorder import Recorder
 from .sniper import Sniper
 from .status import LiveStatus
 from .strategy import ArbitrageStrategy, MomentumStrategy, Signal
-from .supabase_log import estimated_pnl
+from .supabase_log import estimated_pnl, held_naked
 
 log = logging.getLogger("pm5.bot")
 
@@ -188,6 +188,9 @@ class Bot:
                     log.error("paper bankroll exhausted ($%.2f left); stopping",
                               self.executor.bankroll)
                     break
+                # A stale TWAP can book a phantom −$20 and park us. Rebuild
+                # today's total from Gamma + CRM before we decide to sleep.
+                self._reconcile_day_ledger()
                 if self._loss_limit_hit():
                     # Sleep to the next UTC day rather than exit: a supervisor
                     # (Railway, start.ps1) would just restart us into the same
@@ -210,6 +213,71 @@ class Bot:
         log.error("DAILY LOSS LIMIT: %+.2f today ≤ −%.2f; no more trades until the next UTC day",
                   pnl, limit)
         return True
+
+    def _reconcile_day_ledger(self) -> None:
+        """Rebuild today's loss-limit total from Gamma, not a stale TWAP sum.
+
+        13 Sep 16:05 UTC: TWAP was frozen, a winning $20 Up fill booked −$20,
+        and we slept the rest of the day. CRM already had the official result.
+        """
+        if self.cfg.mode != "live":
+            return
+        sb = getattr(self.recorder, "_sb", None)
+        if sb is None or not getattr(sb, "enabled", False):
+            return
+        from .ledger import utc_today
+
+        rows = sb.live_day_windows(utc_today())
+        if not rows:
+            return
+        disc = getattr(self, "discovery", None)
+        total = 0.0
+        n = 0
+        flipped = 0
+        for row in rows:
+            up = float(row.get("up_shares") or 0)
+            dn = float(row.get("down_shares") or 0)
+            cost = float(row.get("cost") or 0)
+            up_won = row.get("up_won")
+            slug = str(row.get("window_slug") or "")
+            if held_naked(up, dn) and disc is not None and slug:
+                try:
+                    official = disc.official_up_won(slug)
+                except Exception:  # noqa: BLE001
+                    official = None
+                if official is not None and official != up_won:
+                    fields = {
+                        "up_won": official,
+                        "estimated_pnl": estimated_pnl(None, official, up, dn, cost),
+                    }
+                    fields["result"] = (
+                        "win" if (fields["estimated_pnl"] or 0) > 0.005
+                        else "loss" if (fields["estimated_pnl"] or 0) < -0.005
+                        else "flat"
+                    )
+                    try:
+                        sb._sb.table("windows").update(fields).eq("mode", "live").eq(
+                            "window_slug", slug,
+                        ).execute()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("crm gamma patch failed %s: %s", slug, e)
+                    up_won = official
+                    row["estimated_pnl"] = fields["estimated_pnl"]
+                    flipped += 1
+            pnl = row.get("estimated_pnl")
+            if pnl is None:
+                pnl = estimated_pnl(None, up_won, up, dn, cost)
+            if pnl is None:
+                continue
+            total += float(pnl)
+            n += 1
+        old = self.ledger.today()
+        self.ledger.replace(round(total, 4), n)
+        if flipped or abs(old - total) > 0.02:
+            log.info(
+                "day ledger reconciled vs Gamma: %+.2f → %+.2f (%d windows, %d crm fixes)",
+                old, total, n, flipped,
+            )
 
     async def _sleep_until_next_utc_day(self) -> None:
         now = time.time()
@@ -808,11 +876,14 @@ class Bot:
     # stream (first tick after the open / our own 60s average) when not.
 
     async def _official_outcome(self, market: Market) -> bool | None:
-        """Poll Gamma until the book snaps to a winner (or 15s)."""
-        deadline = time.monotonic() + 15.0
+        """Poll Gamma until the book snaps to a winner (or 30s)."""
+        disc = getattr(self, "discovery", None)
+        if disc is None:
+            return None
+        deadline = time.monotonic() + 30.0
         last: bool | None = None
         while time.monotonic() < deadline:
-            last = self.discovery.official_up_won(market.slug)
+            last = disc.official_up_won(market.slug)
             if last is not None:
                 return last
             await asyncio.sleep(1.5)
@@ -853,6 +924,10 @@ class Bot:
                     "TWAP close stale (last stamp %.0f, need %.0f); falling back to spot",
                     tick.src_ts, market.window_end,
                 )
+                close = self.feed.twap(market.window_end - self.cfg.twap_secs, market.window_end)
+                if close is None and self.feed.latest:
+                    close = self.feed.latest.price
+                return close, "spot-stale"
         close = self.feed.twap(market.window_end - self.cfg.twap_secs, market.window_end)
         if close is None and self.feed.latest:
             close = self.feed.latest.price
@@ -894,6 +969,19 @@ class Bot:
             up_sh = sum(f.size for f in position.fills if f.side == "up")
             dn_sh = sum(f.size for f in position.fills if f.side == "down")
             est = estimated_pnl(None, up_won, up_sh, dn_sh, position.cost)
+            # Frozen TWAP + spot fallback booked −$20 on a winning Up fill
+            # (12:00–12:05 ET 13 Sep) and tripped the daily limit. Until
+            # Gamma snaps, do not count a guessed full-loss on a held leg.
+            if (
+                official is None
+                and settle_src == "spot-stale"
+                and held_naked(up_sh, dn_sh)
+            ):
+                log.warning(
+                    "not counting held live PnL until Gamma (%s, stale spot)",
+                    market.slug,
+                )
+                est = 0.0
             if est is None:
                 log.info("live fills this window: cost=$%.2f, outcome unknown (open not witnessed)",
                          position.cost)

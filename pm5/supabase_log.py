@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 log = logging.getLogger("pm5.supabase")
@@ -63,6 +63,11 @@ def estimated_pnl(window_pnl, up_won, up_shares: float, down_shares: float, cost
     if paired > 0.01 and abs(up - dn) < 0.5:
         return round(paired - cost, 4)
     return None
+
+
+def held_naked(up_shares: float, down_shares: float) -> bool:
+    up, dn = float(up_shares or 0), float(down_shares or 0)
+    return (up > 0.01 and dn < 0.01) or (dn > 0.01 and up < 0.01)
 
 
 class SupabaseLog:
@@ -149,3 +154,24 @@ class SupabaseLog:
                 if attempt == 1:
                     time.sleep(1.5)
         return False
+
+    def live_day_windows(self, day: str) -> list[dict[str, Any]]:
+        """Traded live windows whose ts falls on the UTC calendar day."""
+        if self._sb is None:
+            return []
+        start = f"{day}T00:00:00+00:00"
+        end = (datetime.fromisoformat(day).replace(tzinfo=timezone.utc) + timedelta(days=1)).isoformat()
+        try:
+            res = (
+                self._sb.table("windows")
+                .select("window_slug,ts,cost,up_shares,down_shares,up_won,estimated_pnl,result")
+                .eq("mode", "live")
+                .eq("traded", True)
+                .gte("ts", start)
+                .lt("ts", end)
+                .execute()
+            )
+            return list(res.data or [])
+        except Exception as e:  # noqa: BLE001
+            log.warning("supabase day read failed: %s", e)
+            return []

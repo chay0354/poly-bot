@@ -325,7 +325,7 @@ def test_close_ref_does_not_reuse_the_open_twap_as_the_close():
     })()
     bot.twap_feed = _twap_feed([(ws, 76574.55)])
     src, kind = asyncio.run(bot._close_ref(m))
-    assert kind == "spot" and src == 99.0
+    assert kind == "spot-stale" and src == 99.0
 
 
 def test_offered_at_walks_depth():
