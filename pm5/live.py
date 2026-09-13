@@ -6,6 +6,7 @@ Isolated here so paper/signal mode never imports signing code or needs a key.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -21,7 +22,7 @@ from py_clob_client_v2 import (
 )
 from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
-from .clob import Fill, PendingTake, RestingOrder
+from .clob import Fill, PendingTake, RestingOrder, taker_fee_usdc
 from .config import Config
 
 log = logging.getLogger("pm5.live")
@@ -264,8 +265,16 @@ class LiveTrader:
             log.error("[LIVE] order rejected for %s: %s", side, resp)
             return None
         cost = round(amount, 4)
-        log.info("[LIVE] BUY %s %.2f sh @ %.3f = $%.2f (id=%s)", side, shares, price, cost, order_id)
-        return Fill(token_id, side, price, shares, cost, paper=False, order_id=order_id)
+        # Taker fee is charged in shares. Recording the gross size makes the
+        # exit sell 1.10 when we only hold 1.0989 (14:03:06) and the stop
+        # never fills — the whole dollar then dies at resolution.
+        fee = taker_fee_usdc(shares, price, self.cfg.taker_fee_rate)
+        net = math.floor((shares - (fee / price if price > 0 else 0.0)) * 100 + 1e-9) / 100
+        if net < 0.01:
+            net = math.floor(shares * 100 + 1e-9) / 100
+        log.info("[LIVE] BUY %s %.2f sh @ %.3f = $%.2f (id=%s, net %.2f after fee)",
+                 side, shares, price, cost, order_id, net)
+        return Fill(token_id, side, price, net, cost, paper=False, order_id=order_id)
 
     def sell(self, token_id: str, side: str, price: float, shares: float) -> Fill | None:
         """Fill-and-Kill marketable sell down to `price` (the worst level the
@@ -299,8 +308,22 @@ class LiveTrader:
                 order_type=OrderType.FAK,
             )
         except Exception as e:  # noqa: BLE001
-            if not self._note_geoblock(e):
-                log.error("[LIVE] sell failed for %s: %s", side, e)
+            if self._note_geoblock(e):
+                return None
+            text = str(e)
+            # Share sell: "balance: 1098900, order amount: 1100000" — fee left
+            # us short. Retry once at the size the CLOB says we actually hold.
+            if "not enough balance" in text and "sum of active orders" not in text:
+                have, _ = parse_clob_usdc(text)
+                qty = math.floor((have or 0.0) * 100 + 1e-9) / 100
+                if have is not None and 0.01 <= qty < amount - 1e-9:
+                    log.warning(
+                        "[LIVE] sell %s: hold %.4f sh < %.2f; retrying %.2f",
+                        side, have, amount, qty,
+                    )
+                    self._last_sell_try.pop(token_id, None)
+                    return self.sell(token_id, side, price, qty)
+            log.error("[LIVE] sell failed for %s: %s", side, e)
             return None
 
         if not isinstance(resp, dict):

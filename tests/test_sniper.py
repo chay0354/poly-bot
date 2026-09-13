@@ -308,6 +308,26 @@ def test_resolution_prefers_the_twap_stream():
     assert asyncio.run(bot._close_ref(m)) == (100.2, "spot")
 
 
+def test_close_ref_does_not_reuse_the_open_twap_as_the_close():
+    """7:10 live 13 Sep: only the open TWAP was in history, close == open,
+    we labelled Up and booked −$1 on a Down that paid."""
+    from pm5.bot import Bot
+
+    bot = Bot.__new__(Bot)
+    bot.cfg = _cfg()
+    m = _mk(seconds_left=0)
+    ws, we = m.window_start, m.window_end
+    bot.feed = type("F", (), {
+        "latest": Tick(price=99.0, src_ts=we, recv_ts=we),
+        "price_at_or_after": lambda self, ts: 100.0,
+        "witnessed_open": lambda self, ts: True,
+        "twap": lambda self, a, b: 99.0,
+    })()
+    bot.twap_feed = _twap_feed([(ws, 76574.55)])
+    src, kind = asyncio.run(bot._close_ref(m))
+    assert kind == "spot" and src == 99.0
+
+
 def test_offered_at_walks_depth():
     top = BookTop(0.50, 10.0, 0.52, 3.0, asks=[(0.52, 3.0), (0.53, 4.0), (0.60, 100.0)])
     assert top.offered_at(0.52) == 3.0

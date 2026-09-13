@@ -115,10 +115,12 @@ class ChainlinkFeed:
 
     # History must outlive a full 5-minute window so the window-open tick is
     # still present at settlement time (300s later).
-    def __init__(self, ws_url: str, host: str, history_secs: float = 360.0) -> None:
+    def __init__(self, ws_url: str, host: str, history_secs: float = 360.0,
+                 symbol: str = "btc/usd") -> None:
         self._url = ws_url
         self._host = host
         self._history_secs = history_secs
+        self.SYMBOL = symbol
         self.latest: Tick | None = None
         self._history: list[Tick] = []
         self._first_src_ts: float | None = None
@@ -293,17 +295,23 @@ class TwapFeed(ChainlinkFeed):
         "subscriptions": [{"topic": "crypto_prices_twap_sixty", "type": "update"}],
     }
 
+    def tick_at(self, ts: float) -> Tick | None:
+        """Last update stamped at or before `ts`. None if history does not
+        reach back that far — never the first tick *after* it."""
+        hit = None
+        for t in self._history:
+            if t.src_ts <= ts + 1e-6:
+                hit = t
+            else:
+                break
+        return hit
+
     def value_at(self, ts: float) -> float | None:
         """The stream's value at source time `ts`: the last update stamped
         at or before it. None if our history does not reach back that far
         (we were not listening yet), never the first tick *after* it."""
-        val = None
-        for t in self._history:
-            if t.src_ts <= ts + 1e-6:
-                val = t.price
-            else:
-                break
-        return val
+        tick = self.tick_at(ts)
+        return tick.price if tick is not None else None
 
     def witnessed_open(self, window_start: float) -> bool:
         return self.value_at(window_start) is not None

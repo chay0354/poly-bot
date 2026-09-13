@@ -1,7 +1,7 @@
-"""Discovery of the current 5-minute BTC up/down market via the Gamma API.
+"""Discovery of the current 5-minute Up/Down market via the Gamma API.
 
 Markets are deterministic: a new one opens every 300s aligned to the Unix
-epoch, with slug ``btc-updown-5m-{window_start_ts}``.
+epoch, with slug ``{asset}-updown-5m-{window_start_ts}`` (btc or eth).
 """
 
 from __future__ import annotations
@@ -49,17 +49,19 @@ def current_window_start(now: float | None = None) -> int:
     return now - (now % WINDOW_SECS)
 
 
-def slug_for(window_start: int) -> str:
-    return f"btc-updown-5m-{window_start}"
+def slug_for(window_start: int, asset: str = "btc") -> str:
+    return f"{asset}-updown-5m-{window_start}"
 
 
 class MarketDiscovery:
-    def __init__(self, gamma_url: str, client: httpx.Client | None = None) -> None:
+    def __init__(self, gamma_url: str, client: httpx.Client | None = None,
+                 asset: str = "btc") -> None:
         self._url = gamma_url.rstrip("/")
         self._client = client or httpx.Client(timeout=15)
+        self.asset = asset
 
     def fetch(self, window_start: int) -> Market | None:
-        slug = slug_for(window_start)
+        slug = slug_for(window_start, self.asset)
         try:
             r = self._client.get(f"{self._url}/events", params={"slug": slug})
             r.raise_for_status()

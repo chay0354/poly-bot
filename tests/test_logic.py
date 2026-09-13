@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import time
 
 from pm5.bot import Bot, Position
@@ -29,6 +30,26 @@ def make_market(seconds_left=30) -> Market:
 
 def test_slug_format():
     assert slug_for(1781263200) == "btc-updown-5m-1781263200"
+    assert slug_for(1781263200, "eth") == "eth-updown-5m-1781263200"
+
+
+def test_eth_preset_rewires_feeds():
+    from pm5.config import Config
+
+    old = os.environ.get("PM_ASSET")
+    os.environ["PM_ASSET"] = "eth"
+    os.environ.pop("PM_JUMP_MIN_USD", None)
+    try:
+        cfg = Config()
+        assert cfg.asset == "eth" and cfg.slug_prefix == "eth-updown-5m"
+        assert cfg.chainlink_symbol == "eth/usd" and cfg.coinbase_product == "ETH-USD"
+        assert "ethusdt" in cfg.fast_feed_url
+        assert cfg.jump_min_usd == 3.0
+    finally:
+        if old is None:
+            os.environ.pop("PM_ASSET", None)
+        else:
+            os.environ["PM_ASSET"] = old
     m = make_market()
     assert m.browser_url.startswith("https://polymarket.com/event/btc-updown-5m-")
 
@@ -444,6 +465,7 @@ def test_momentum_refuses_cheap_ask_when_book_disagrees():
 
 def test_momentum_leg_carries_floor_from_config():
     cfg = Config()
+    cfg.momentum_enabled = True
     cfg.min_price = 0.55
     cfg.min_delta_usd = 8.0
     feed = ChainlinkFeed("wss://x", "x")
@@ -515,6 +537,8 @@ def test_bankroll_exhausted_stop_condition():
     cfg.momentum_enabled = True
     cfg.arb_enabled = False
     cfg.maker_enabled = False
+    cfg.snipe_enabled = False
+    cfg.favorite_enabled = False
     cfg.stake_usdc = 5.0
     bot = Bot.__new__(Bot)
     bot.cfg = cfg

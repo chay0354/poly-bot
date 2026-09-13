@@ -25,6 +25,25 @@ def _b(name: str, default: bool) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# 5-minute Up/Down markets on Polymarket. Slug is `{asset}-updown-5m-{ts}`.
+ASSET_PRESETS: dict[str, dict] = {
+    "btc": {
+        "slug_prefix": "btc-updown-5m",
+        "symbol": "btc/usd",
+        "binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
+        "coinbase_product": "BTC-USD",
+        "jump_min_usd": 10.0,
+    },
+    "eth": {
+        "slug_prefix": "eth-updown-5m",
+        "symbol": "eth/usd",
+        "binance_url": "wss://stream.binance.com:9443/ws/ethusdt@aggTrade",
+        "coinbase_product": "ETH-USD",
+        "jump_min_usd": 3.0,
+    },
+}
+
+
 @dataclass
 class Config:
     # --- Mode ---
@@ -32,6 +51,11 @@ class Config:
     # paper  = simulate fills against the live order book, no real money.
     # live   = sign and post real orders via the CLOB.
     mode: str = field(default_factory=lambda: os.getenv("PM_MODE", "signal").lower())
+    # Which 5-minute Up/Down market: btc (default) or eth.
+    asset: str = field(default_factory=lambda: os.getenv("PM_ASSET", "btc").strip().lower())
+    slug_prefix: str = ""
+    chainlink_symbol: str = ""
+    coinbase_product: str = ""
 
     # --- Wallet / API (only needed in live mode) ---
     private_key: str = field(default_factory=lambda: os.getenv("PM_PRIVATE_KEY", ""))
@@ -233,6 +257,34 @@ class Config:
     # if the quote survived the whole way. Set it to what live shows.
     sim_latency_ms: float = field(default_factory=lambda: _f("PM_SIM_LATENCY_MS", 150.0))
 
+    # --- Favorite (confirmed 90¢ + breakdown exit) ---
+    # Buy a side that has *stayed* at TRIGGER, not the first flicker, and
+    # sell on a real breakdown (~0.70) instead of waiting for 0.40.
+    favorite_enabled: bool = field(default_factory=lambda: _b("PM_FAVORITE", False))
+    # If > 0, size each buy to this many USDC (shares = stake / ask).
+    # 0 → use favorite_shares instead.
+    favorite_stake_usdc: float = field(default_factory=lambda: _f("PM_FAVORITE_STAKE_USDC", 0.0))
+    favorite_shares: float = field(default_factory=lambda: _f("PM_FAVORITE_SHARES", 5.0))
+    favorite_trigger: float = field(default_factory=lambda: _f("PM_FAVORITE_TRIGGER", 0.88))
+    # Refuse richer asks: 0.96 is win $0.04 / lose $0.96.
+    favorite_max_price: float = field(default_factory=lambda: _f("PM_FAVORITE_MAX", 0.95))
+    # Ask must sit at/above trigger − GIVE for this long before we buy.
+    favorite_hold_secs: float = field(default_factory=lambda: _f("PM_FAVORITE_HOLD", 1.0))
+    favorite_persist_give: float = field(default_factory=lambda: _f("PM_FAVORITE_PERSIST_GIVE", 0.02))
+    # FOK may miss if the 90¢ ticks up one cent; allow this much chase, capped at MAX.
+    favorite_chase: float = field(default_factory=lambda: _f("PM_FAVORITE_CHASE", 0.02))
+    favorite_min_left: float = field(default_factory=lambda: _f("PM_FAVORITE_MIN_LEFT", 20.0))
+    favorite_max_left: float = field(default_factory=lambda: _f("PM_FAVORITE_MAX_LEFT", 180.0))
+    # Sell when our bid has fallen to this (a breakdown). 0.40 is too late.
+    favorite_stop: float = field(default_factory=lambda: _f("PM_FAVORITE_STOP", 0.50))
+    favorite_exit_min_bid: float = field(default_factory=lambda: _f("PM_FAVORITE_EXIT_MIN_BID", 0.15))
+    favorite_exit_slip: float = field(default_factory=lambda: _f("PM_FAVORITE_EXIT_SLIP", 0.03))
+    # Require the fast-feed / TWAP Δ to already favor that side.
+    favorite_tape: bool = field(default_factory=lambda: _b("PM_FAVORITE_TAPE", True))
+    favorite_tape_usd: float = field(default_factory=lambda: _f("PM_FAVORITE_TAPE_USD", 5.0))
+    # Ignore a 0.90 if the other side is dust (broken book, not a decision).
+    favorite_other_min: float = field(default_factory=lambda: _f("PM_FAVORITE_OTHER_MIN", 0.08))
+
     # --- Fees ---
     # Polymarket crypto taker fee: shares × rate × p × (1-p). Makers pay 0.
     # Applied to paper fills so paper P&L is honest.
@@ -255,6 +307,21 @@ class Config:
     # Record the BTC price + up/down asks each second over the last N seconds of
     # a window (the decision zone), so the strategy can be backtested. 0 = off.
     path_secs: float = field(default_factory=lambda: _f("PM_PATH_SECS", 120.0))
+
+    def __post_init__(self) -> None:
+        preset = ASSET_PRESETS.get(self.asset)
+        if preset is None:
+            raise SystemExit(
+                f"PM_ASSET={self.asset} unknown; use {', '.join(sorted(ASSET_PRESETS))}"
+            )
+        self.slug_prefix = preset["slug_prefix"]
+        self.chainlink_symbol = preset["symbol"]
+        self.coinbase_product = preset["coinbase_product"]
+        url = os.getenv("PM_FAST_FEED_URL")
+        if url is None or any(s in self.fast_feed_url for s in ("btcusdt", "ethusdt")):
+            self.fast_feed_url = preset["binance_url"]
+        if os.getenv("PM_JUMP_MIN_USD") is None:
+            self.jump_min_usd = preset["jump_min_usd"]
 
     def require_live_creds(self) -> None:
         if self.mode == "live" and not self.private_key:

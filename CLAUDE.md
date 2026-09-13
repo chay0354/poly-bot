@@ -42,7 +42,7 @@ live mode without a key.
 window (`_trade_window`) wires the pieces together:
 
 - **Discovery** (`markets.py`) — markets are found by a *deterministic slug*
-  `btc-updown-5m-{window_start}` (`window_start = now - now % 300`), never by
+  `{asset}-updown-5m-{window_start}` (`PM_ASSET=btc|eth`, `window_start = now - now % 300`), never by
   search. One Gamma API call yields the Up/Down `clobTokenIds`, condition id, tick
   size.
 - **Price feed** (`pricefeed.py`) — a background asyncio task streams the Chainlink
@@ -138,6 +138,13 @@ window (`_trade_window`) wires the pieces together:
  optional scalp (`PM_SNIPE_SCALP`) sells back at entry + `PM_SNIPE_TAKE`.
  `PM_SNIPE_KILL_STREAK` losing snipes in a row stand the sniper down for the
  UTC day (someone is faster; the quotes we are hitting are bait).
+- **Favorite** (`favorite.py`, `PM_FAVORITE`, off by default) — buy a side
+ that has *stayed* in `[PM_FAVORITE_TRIGGER, PM_FAVORITE_MAX]` (0.88–0.95)
+ for `PM_FAVORITE_HOLD` seconds in the middle-late window, only if the
+ fast-feed Δ already agrees. The first 90¢ flicker is −EV; so is paying
+ 0.96. If the bid then breaks to `PM_FAVORITE_STOP` (0.50) or the tape
+ flips while we can still sell, FAK-sell — do not wait for 0.40. One shot
+ per window; never stacked on an existing maker/snipe/momentum fill.
 - **Daily loss limit** (`ledger.py`, `PM_DAILY_LOSS_LIMIT`) — per-UTC-day P&L
  persisted to `data/day_pnl_{mode}.json`. Live windows are *estimated*
  (`supabase_log.estimated_pnl`: pairs pay $1, exits are realized, a held leg

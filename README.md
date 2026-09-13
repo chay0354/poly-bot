@@ -188,23 +188,20 @@ This is a **long-running worker**, not a website. Do **not** deploy to Vercel.
    | `PM_PRIVATE_KEY` | your key (Railway secret, not git) |
    | `PM_SIGNATURE_TYPE` | `3` for current Polymarket email/deposit wallets |
    | `PM_FUNDER_ADDRESS` | your Polymarket profile / API address |
-   | `PM_STAKE_USDC` | `5` |
-   | `PM_MAKER` | `true` |
-   | `PM_MAKER_BID` | `0.46` |
-   | `PM_MAKER_STAKE_USDC` | `5` |
-   | `PM_MAKER_PAIR_GRACE` | `5` |
-   | `PM_MAKER_PAIR_MAX_SUM` | `1.00` |
-   | `PM_MAKER_PAIR_HARD` | `20` |
-   | `PM_MAKER_PAIR_HARD_SUM` | `1.00` |
-   | `PM_MAKER_DEFENSIVE_USD` | `20` |
-   | `PM_MAKER_EXIT_SECS` | `20` |
-   | `PM_MAKER_EXIT_MIN_BID` | `0.10` |
-   | `PM_MAKER_HEDGE_MAX` | `0.60` |
-   | `PM_MOMENTUM` | `true` |
-   | `PM_MIN_PRICE` | `0.50` |
-   | `PM_MAX_PRICE` | `0.85` |
-   | `PM_MIN_DELTA_USD` | `25` |
+   | `PM_ASSET` | `btc` |
+   | `PM_MAKER` | `false` |
+   | `PM_MOMENTUM` | `false` |
    | `PM_ARB` | `false` |
+   | `PM_SNIPE` | `false` |
+   | `PM_FAVORITE` | `true` |
+   | `PM_FAVORITE_STAKE_USDC` | `20` |
+   | `PM_FAVORITE_TRIGGER` | `0.88` |
+   | `PM_FAVORITE_MAX` | `0.95` |
+   | `PM_FAVORITE_HOLD` | `1` |
+   | `PM_FAVORITE_STOP` | `0.50` |
+   | `PM_FAVORITE_TAPE` | `true` |
+   | `PM_FAVORITE_TAPE_USD` | `5` |
+   | `PM_DAILY_LOSS_LIMIT` | `40` |
    | `PM_LIVE_STATUS` | `false` |
    | `SUPABASE_URL` | project URL (optional; bot writes settled P&L) |
    | `SUPABASE_SECRET_KEY` | `sb_secret_…` (Railway secret, not git) |

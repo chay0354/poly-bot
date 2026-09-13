@@ -23,6 +23,7 @@ from .clob import BookReader, Executor, Fill
 from .clobws import MarketStream
 from .config import Config
 from .fastfeed import BinanceFeed, CoinbaseFeed, FastFeeds
+from .favorite import Favorite
 from .jumps import JumpWatch
 from .ledger import DayLedger
 from .maker import MakerPair
@@ -65,14 +66,17 @@ class Bot:
         self.status = status or LiveStatus(enabled=False)
         net.bootstrap()
         self._http = httpx.Client(timeout=15)
-        self.discovery = MarketDiscovery(cfg.gamma_url, self._http)
+        self.discovery = MarketDiscovery(cfg.gamma_url, self._http, asset=cfg.asset)
         self.market_stream = MarketStream() if cfg.ws_market and cfg.mode != "signal" else None
         self.reader = BookReader(cfg.clob_url, self._http, stream=self.market_stream)
         self.executor = Executor(cfg, self.reader)
-        self.feed = ChainlinkFeed(cfg.ws_live_url, net.WS_LIVE_HOST)
+        self.feed = ChainlinkFeed(cfg.ws_live_url, net.WS_LIVE_HOST, symbol=cfg.chainlink_symbol)
         # The 60s TWAP stream the market actually resolves on: both the
         # "price to beat" and the close are read from it when it is up.
-        self.twap_feed = TwapFeed(cfg.ws_live_url, net.WS_LIVE_HOST) if cfg.twap_feed else None
+        self.twap_feed = (
+            TwapFeed(cfg.ws_live_url, net.WS_LIVE_HOST, symbol=cfg.chainlink_symbol)
+            if cfg.twap_feed else None
+        )
         # The loop is event-driven: every feed tick, book change and order
         # event sets `_wake`; the loop's sleep is only an idle timeout.
         self._wake = asyncio.Event()
@@ -84,7 +88,9 @@ class Bot:
         if cfg.fast_feed:
             fast_feeds.append(BinanceFeed(cfg.fast_feed_url, on_tick=self._wake.set))
         if cfg.coinbase_feed:
-            fast_feeds.append(CoinbaseFeed(cfg.coinbase_feed_url, on_tick=self._wake.set))
+            fast_feeds.append(CoinbaseFeed(
+                cfg.coinbase_feed_url, product=cfg.coinbase_product, on_tick=self._wake.set,
+            ))
         self.fast = FastFeeds(fast_feeds) if fast_feeds else None
         if self.market_stream is not None:
             self.market_stream.on_event = self._wake.set
@@ -140,9 +146,9 @@ class Bot:
             )
         else:
             log.info(
-                "starting in %s mode | stake=$%.2f | bankroll=%s | "
+                "starting in %s mode | %s 5m | stake=$%.2f | bankroll=%s | "
                 "momentum TWAP%.0fs Δ≥$%.0f flip≥$%.0f ask $%.2f–$%.2f | maker %s",
-                self.cfg.mode.upper(), self.cfg.stake_usdc,
+                self.cfg.mode.upper(), self.cfg.asset.upper(), self.cfg.stake_usdc,
                 f"${bank:.2f}" if bank is not None else "unlimited",
                 self.cfg.twap_secs, self.cfg.min_delta_usd, self.cfg.min_flip_usd,
                 self.cfg.min_price, self.cfg.max_price,
@@ -160,6 +166,21 @@ class Bot:
                      f"{self.cfg.snipe_max_price:.2f}, {'scalp' if self.cfg.snipe_scalp else 'hold'}"
                      + (f", sim latency {self.cfg.sim_latency_ms:.0f}ms" if self.cfg.mode == "paper" else ""))
                     if self.cfg.snipe_enabled else "off",
+                )
+            if self.cfg.favorite_enabled:
+                size = (
+                    f"${self.cfg.favorite_stake_usdc:.2f}/fill"
+                    if self.cfg.favorite_stake_usdc > 0
+                    else f"{self.cfg.favorite_shares:g} sh"
+                )
+                log.info(
+                    "favorite ON: ask %.2f–%.2f held ≥%.1fs, T-%.0f–%.0fs, "
+                    "tape %s, stop bid ≤%.2f, %s",
+                    self.cfg.favorite_trigger, self.cfg.favorite_max_price,
+                    self.cfg.favorite_hold_secs, self.cfg.favorite_min_left,
+                    self.cfg.favorite_max_left,
+                    (f"Δ≥${self.cfg.favorite_tape_usd:.0f}" if self.cfg.favorite_tape else "off"),
+                    self.cfg.favorite_stop, size,
                 )
         try:
             while True:
@@ -208,6 +229,11 @@ class Bot:
             costs.append(2 * self.cfg.maker_stake_usdc)  # both bids may fill
         if self.cfg.snipe_enabled:
             costs.append(self.cfg.snipe_shares * self.cfg.snipe_max_price)
+        if self.cfg.favorite_enabled:
+            if self.cfg.favorite_stake_usdc > 0:
+                costs.append(self.cfg.favorite_stake_usdc)
+            else:
+                costs.append(self.cfg.favorite_shares * self.cfg.favorite_max_price)
         return min(costs) if costs else self.cfg.stake_usdc
 
     def _bankroll_exhausted(self) -> bool:
@@ -253,6 +279,10 @@ class Bot:
             Sniper(self.cfg, self.executor, market)
             if watch is not None and self._snipe_allowed() else None
         )
+        favorite = (
+            Favorite(self.cfg, market)
+            if self.cfg.favorite_enabled and self.cfg.mode != "signal" else None
+        )
         if maker is not None or sniper is not None:
             self._presign(market)  # no-op if the prefetch already did it
         ticks = 0
@@ -290,7 +320,7 @@ class Bot:
                 up_top = down_top = None
                 if (
                     self.status.enabled or self.cfg.arb_enabled or sampling
-                    or maker is not None or watch is not None
+                    or maker is not None or watch is not None or favorite is not None
                 ):
                     up_top = self.reader.top(market.up_token)
                     down_top = self.reader.top(market.down_token)
@@ -322,7 +352,7 @@ class Bot:
                             self._presign(next_market)
 
                 fast_delta = sigma = None
-                if maker is not None or watch is not None:
+                if maker is not None or watch is not None or favorite is not None:
                     fast_delta = (
                         self.fast.delta_since(market.window_start)
                         if self.fast is not None else None
@@ -394,7 +424,29 @@ class Bot:
                                 sniper.mark_exited(fills)
                                 self._record_fills(market, scalp, fills, open_price)
 
-                if trades < self.cfg.max_trades_per_window:
+                if favorite is not None:
+                    if favorite.side is None and not position.fills:
+                        fav = favorite.evaluate(up_top, down_top, fast_delta)
+                        if fav is not None:
+                            fills = self._execute(fav, market)
+                            if fills:
+                                for f in fills:
+                                    position.add(f)
+                                favorite.mark_filled(fills)
+                                self._record_fills(market, fav, fills, open_price)
+                    elif favorite.side is not None:
+                        cut = favorite.exit_signal(up_top, down_top, fast_delta)
+                        if cut is not None:
+                            fills = self._execute(cut, market)
+                            if fills:
+                                for f in fills:
+                                    position.add(f)
+                                favorite.mark_exited(fills)
+                                self._record_fills(market, cut, fills, open_price)
+
+                if trades < self.cfg.max_trades_per_window and (
+                    favorite is None or favorite.side is None
+                ):
                     # Momentum only when we actually saw the open; arb is always safe.
                     signal = self._pick_signal(market, witnessed, up_top, down_top)
                     if signal is not None:
@@ -602,7 +654,7 @@ class Bot:
             return self._announce_signal(signal, market)
         if signal.kind == "arb":
             return self._execute_arb(signal)
-        if signal.kind in ("maker-exit", "snipe-exit"):
+        if signal.kind in ("maker-exit", "snipe-exit", "favorite-exit"):
             return self._execute_exit(signal)
         side = signal.legs[0].side
         if self._should_log(f"sig:mom:{side}"):
@@ -778,10 +830,18 @@ class Bot:
     async def _close_ref(self, market: Market) -> tuple[float | None, str]:
         if self._twap_alive():
             tf = self.twap_feed
-            await tf.wait_for(market.window_end, timeout=6.0)
-            v = tf.value_at(market.window_end)
-            if v is not None:
-                return v, "twap60"
+            fresh = await tf.wait_for(market.window_end, timeout=8.0)
+            tick = tf.tick_at(market.window_end)
+            # A tick stamped at/after the close. Reusing the *open* TWAP
+            # (same price, same stamp) makes close == open and labels every
+            # stale window Up — 7:10–7:15 ET 13 Sep: Down paid, we booked −$1.
+            if fresh and tick is not None and tick.src_ts >= market.window_end - 1.0:
+                return tick.price, "twap60"
+            if tick is not None:
+                log.warning(
+                    "TWAP close stale (last stamp %.0f, need %.0f); falling back to spot",
+                    tick.src_ts, market.window_end,
+                )
         close = self.feed.twap(market.window_end - self.cfg.twap_secs, market.window_end)
         if close is None and self.feed.latest:
             close = self.feed.latest.price
@@ -817,10 +877,18 @@ class Bot:
             else:
                 self.session_pnl += est
             day = self.ledger.add(est)
-            log.info("live window est. PnL=%+.2f | session=%+.2f | today=%+.2f%s",
-                     est, self.session_pnl, day,
-                     f" (limit −{self.cfg.daily_loss_limit_usdc:.2f})"
-                     if self.cfg.daily_loss_limit_usdc > 0 else "")
+            log.info(
+                "live window est. PnL=%+.2f | %s | beat=%s close=%s (%s) | "
+                "session=%+.2f | today=%+.2f%s",
+                est,
+                ("UP won" if up_won is True else "DOWN won" if up_won is False else "outcome ?"),
+                f"{open_price:.2f}" if open_price is not None else "?",
+                f"{close_price:.2f}" if close_price is not None else "?",
+                settle_src,
+                self.session_pnl, day,
+                f" (limit −{self.cfg.daily_loss_limit_usdc:.2f})"
+                if self.cfg.daily_loss_limit_usdc > 0 else "",
+            )
         elif up_won is None:
             # Should not happen (momentum is gated on `witnessed`), but never
             # fabricate a settlement we can't compute. Refund the paper stake so

@@ -68,6 +68,7 @@ def test_projection_and_flip_requirement():
 
 def test_momentum_requires_flip_margin():
     cfg = Config()
+    cfg.momentum_enabled = True
     cfg.min_delta_usd = 10
     cfg.min_flip_usd = 60
     cfg.decide_within_secs = 45

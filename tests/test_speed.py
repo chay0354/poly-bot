@@ -4,6 +4,7 @@ leading feed, and pre-signed bids."""
 
 import asyncio
 import json
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -469,6 +470,18 @@ def test_parse_clob_usdc_splits_total_from_locked_bids():
     assert total == pytest.approx(3.626057)
     assert locked == pytest.approx(2.25)
     assert (total - locked) == pytest.approx(1.376057)
+
+
+def test_parse_clob_share_balance_on_oversized_sell():
+    # 14:03 live: bought 1.10 Down, fee left 1.0989, sell 1.10 was rejected.
+    text = (
+        "not enough balance / allowance: the balance is not enough -> "
+        "balance: 1098900, order amount: 1100000"
+    )
+    have, locked = parse_clob_usdc(text)
+    assert have == pytest.approx(1.0989)
+    assert locked is None
+    assert math.floor(have * 100 + 1e-9) / 100 == 1.09
 
 
 def test_maker_pulls_the_lone_leg_when_the_other_cannot_be_funded():
