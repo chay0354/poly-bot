@@ -175,12 +175,14 @@ class Bot:
                 )
                 log.info(
                     "favorite ON: ask %.2f–%.2f held ≥%.1fs, T-%.0f–%.0fs, "
-                    "tape %s, stop bid ≤%.2f, %s",
+                    "tape %s, stop bid ≤%.2f for ≥%.1fs after %.0fs, floor %.2f, %s",
                     self.cfg.favorite_trigger, self.cfg.favorite_max_price,
                     self.cfg.favorite_hold_secs, self.cfg.favorite_min_left,
                     self.cfg.favorite_max_left,
                     (f"Δ≥${self.cfg.favorite_tape_usd:.0f}" if self.cfg.favorite_tape else "off"),
-                    self.cfg.favorite_stop, size,
+                    self.cfg.favorite_stop, self.cfg.favorite_exit_hold_secs,
+                    self.cfg.favorite_exit_grace_secs, self.cfg.favorite_exit_min_bid,
+                    size,
                 )
         try:
             while True:

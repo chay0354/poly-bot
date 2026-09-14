@@ -12,8 +12,9 @@ loss. This is the version that can survive:
        market is resolving, enough time left to exit).
     4. The tape (fast-feed Δ vs the price to beat) must already agree.
        A 90¢ Up while ETH/BTC is red is the book lying.
-    5. Stop on a *breakdown*, not a flicker: bid ≤ STOP (0.70), or the tape
-       flips against us while we can still sell. Do not wait for 40¢.
+    5. Stop on a *persisted* breakdown: bid ≤ STOP for EXIT_HOLD seconds,
+       and only after EXIT_GRACE from the fill. A one-tick 50¢ (and a tape
+       flip at 80¢) was the overnight −$8 to −$16. Do not FAK under MIN_BID.
 
 One shot per window. The buy is a normal taker (the quote has been sitting
 for seconds — we are not racing). The exit is a FAK sell that may walk
@@ -43,6 +44,8 @@ class Favorite:
         self.fills: list[Fill] = []
         self.exited = False
         self.last_signal: Signal | None = None
+        self._filled_at: float | None = None
+        self._broke_at: float | None = None
 
     # ----------------------------------------------------------------- state
 
@@ -70,6 +73,8 @@ class Favorite:
 
     def mark_filled(self, fills: list[Fill]) -> None:
         self.fills.extend(fills)
+        if self._filled_at is None and self.side is not None:
+            self._filled_at = self._clock()
 
     def mark_exited(self, fills: list[Fill]) -> None:
         self.fills.extend(fills)
@@ -166,7 +171,7 @@ class Favorite:
         down_top: BookTop | None,
         tape_delta: float | None,
     ) -> Signal | None:
-        """Sell on a real breakdown. 40¢ is too late; 70¢ still has a bid."""
+        """Sell on a persisted breakdown. A 50¢ flicker is not one."""
         if self.exited or self.side is None:
             return None
         side = self.side
@@ -175,20 +180,27 @@ class Favorite:
             return None
         bid = top.best_bid
         if bid < self.cfg.favorite_exit_min_bid:
-            return None  # dust — dumping 5sh at 0.04 is worse than holding
+            return None  # hole — FAK-walking $20 to 15–34¢ is worse than holding
         qty = self.shares
         if qty < 0.01:
             return None
+        now = self._clock()
+        if (
+            self._filled_at is not None
+            and now - self._filled_at < self.cfg.favorite_exit_grace_secs - 1e-9
+        ):
+            return None
 
-        tape = self._tape_side(tape_delta)
-        tape_broke = (
-            self.cfg.favorite_tape
-            and tape is not None
-            and tape != side
-            and bid <= self.cfg.favorite_trigger - 0.10 + 1e-9
-        )
-        book_broke = bid <= self.cfg.favorite_stop + 1e-9
-        if not book_broke and not tape_broke:
+        # Tape-only cuts (bid 0.53–0.80) were −EV: the 5-min still paid.
+        if bid <= self.cfg.favorite_stop + 1e-9:
+            if self._broke_at is None:
+                self._broke_at = now
+        else:
+            self._broke_at = None
+        if (
+            self._broke_at is None
+            or now - self._broke_at < self.cfg.favorite_exit_hold_secs - 1e-9
+        ):
             return None
 
         floor = round(max(
@@ -196,9 +208,8 @@ class Favorite:
             bid - self.cfg.favorite_exit_slip,
         ), 2)
         why = (
-            f"bid {bid:.2f} ≤ stop {self.cfg.favorite_stop:.2f}"
-            if book_broke else
-            f"tape flipped vs {side} (Δ {tape_delta:+.1f}), bid {bid:.2f}"
+            f"bid {bid:.2f} ≤ stop {self.cfg.favorite_stop:.2f} "
+            f"for {now - self._broke_at:.1f}s"
         )
         sig = Signal(
             kind="favorite-exit",

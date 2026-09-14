@@ -277,7 +277,13 @@ class Config:
     favorite_max_left: float = field(default_factory=lambda: _f("PM_FAVORITE_MAX_LEFT", 180.0))
     # Sell when our bid has fallen to this (a breakdown). 0.40 is too late.
     favorite_stop: float = field(default_factory=lambda: _f("PM_FAVORITE_STOP", 0.50))
-    favorite_exit_min_bid: float = field(default_factory=lambda: _f("PM_FAVORITE_EXIT_MIN_BID", 0.15))
+    # Bid must stay ≤ STOP this long (13/14 Sep: a one-tick 50¢ was a chop,
+    # then that side still paid). 0 = fire on the first touch.
+    favorite_exit_hold_secs: float = field(default_factory=lambda: _f("PM_FAVORITE_EXIT_HOLD", 8.0))
+    # No stop for this long after the buy (same nights: 6–20s flickers).
+    favorite_exit_grace_secs: float = field(default_factory=lambda: _f("PM_FAVORITE_EXIT_GRACE", 15.0))
+    # Refuse to FAK into a hole. 0.15 walked $20 to 15–34¢; hold instead.
+    favorite_exit_min_bid: float = field(default_factory=lambda: _f("PM_FAVORITE_EXIT_MIN_BID", 0.40))
     favorite_exit_slip: float = field(default_factory=lambda: _f("PM_FAVORITE_EXIT_SLIP", 0.03))
     # Require the fast-feed / TWAP Δ to already favor that side.
     favorite_tape: bool = field(default_factory=lambda: _b("PM_FAVORITE_TAPE", True))

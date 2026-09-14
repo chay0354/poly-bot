@@ -40,6 +40,8 @@ def _cfg(**kw) -> Config:
     cfg.favorite_min_left = 25.0
     cfg.favorite_max_left = 120.0
     cfg.favorite_stop = 0.70
+    cfg.favorite_exit_hold_secs = 0.0
+    cfg.favorite_exit_grace_secs = 0.0
     cfg.favorite_exit_min_bid = 0.15
     cfg.favorite_exit_slip = 0.03
     cfg.favorite_tape = True
@@ -168,13 +170,47 @@ def test_favorite_exit_on_breakdown_not_a_dip():
     assert abs(cut.legs[0].min_price - 0.67) < 1e-9  # bid 0.70 − slip 0.03
 
 
-def test_favorite_exit_on_tape_flip_while_bid_is_still_alive():
+def test_favorite_does_not_exit_on_tape_flip_alone():
+    # 13/14 Sep: tape-only cuts at 0.53–0.80 sold sides that still paid.
     fav, _ = _fav()
     fav.mark_filled([_fill()])
-    # Tape flipped, bid already off the 0.90 (≤ trigger − 0.10).
-    cut = fav.exit_signal(_book(0.82, bid=0.80), _book(0.22), -12.0)
+    assert fav.exit_signal(_book(0.82, bid=0.80), _book(0.22), -12.0) is None
+
+
+def test_favorite_exit_needs_stop_to_persist():
+    fav, now = _fav(favorite_exit_hold_secs=8.0)
+    fav.mark_filled([_fill()])
+    assert fav.exit_signal(_book(0.72, bid=0.70), _book(0.30), 20.0) is None
+    now["t"] += 7.9
+    assert fav.exit_signal(_book(0.72, bid=0.70), _book(0.30), 20.0) is None
+    now["t"] += 0.2
+    cut = fav.exit_signal(_book(0.72, bid=0.70), _book(0.30), 20.0)
     assert cut is not None and cut.kind == "favorite-exit"
-    assert "tape flipped" in cut.reason
+
+
+def test_favorite_exit_resets_if_bid_recovers():
+    fav, now = _fav(favorite_exit_hold_secs=8.0)
+    fav.mark_filled([_fill()])
+    fav.exit_signal(_book(0.72, bid=0.70), _book(0.30), 20.0)
+    now["t"] += 4.0
+    fav.exit_signal(_book(0.90, bid=0.88), _book(0.12), 20.0)  # recovered
+    now["t"] += 8.0
+    assert fav.exit_signal(_book(0.72, bid=0.70), _book(0.30), 20.0) is None
+
+
+def test_favorite_exit_grace_after_fill():
+    fav, now = _fav(favorite_exit_grace_secs=15.0)
+    fav.mark_filled([_fill()])
+    assert fav.exit_signal(_book(0.72, bid=0.70), _book(0.30), 20.0) is None
+    now["t"] += 15.0
+    cut = fav.exit_signal(_book(0.72, bid=0.70), _book(0.30), 20.0)
+    assert cut is not None and cut.kind == "favorite-exit"
+
+
+def test_favorite_does_not_fak_into_a_hole():
+    fav, _ = _fav(favorite_exit_min_bid=0.40)
+    fav.mark_filled([_fill()])
+    assert fav.exit_signal(_book(0.40, bid=0.34), _book(0.70), -20.0) is None
 
 
 def test_favorite_does_not_dump_into_dust():
