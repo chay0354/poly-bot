@@ -261,6 +261,9 @@ class Config:
     # Buy a side that has *stayed* at TRIGGER, not the first flicker, and
     # sell on a real breakdown (~0.70) instead of waiting for 0.40.
     favorite_enabled: bool = field(default_factory=lambda: _b("PM_FAVORITE", False))
+    # When true (default), ignore the tight Railway knobs and enter often:
+    # 0.85–0.97, no hold, T-15–240s, no tape, no jump/50¢ entry skip.
+    favorite_loose: bool = field(default_factory=lambda: _b("PM_FAVORITE_LOOSE", True))
     # If > 0, size each buy to this many USDC (shares = stake / ask).
     # 0 → use favorite_shares instead.
     favorite_stake_usdc: float = field(default_factory=lambda: _f("PM_FAVORITE_STAKE_USDC", 0.0))
@@ -338,6 +341,15 @@ class Config:
             self.fast_feed_url = preset["binance_url"]
         if os.getenv("PM_JUMP_MIN_USD") is None:
             self.jump_min_usd = preset["jump_min_usd"]
+        if self.favorite_loose:
+            self.favorite_trigger = 0.85
+            self.favorite_max_price = 0.97
+            self.favorite_hold_secs = 0.0
+            self.favorite_min_left = 15.0
+            self.favorite_max_left = 240.0
+            self.favorite_tape = False
+            self.favorite_skip_chop = False
+            self.favorite_other_min = 0.02
 
     def require_live_creds(self) -> None:
         if self.mode == "live" and not self.private_key:

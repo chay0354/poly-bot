@@ -27,6 +27,7 @@ def _cfg(**kw) -> Config:
     cfg.mode = "paper"
     cfg.paper_bankroll = 0.0
     cfg.favorite_enabled = True
+    cfg.favorite_loose = False
     cfg.snipe_enabled = False
     cfg.momentum_enabled = False
     cfg.maker_enabled = False

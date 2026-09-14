@@ -182,6 +182,8 @@ class Bot:
                     f"skip chop (stop / jump ≤{self.cfg.favorite_chop_secs:.0f}s)"
                     if self.cfg.favorite_skip_chop else "chop ok"
                 )
+                if self.cfg.favorite_loose:
+                    chop = "LOOSE " + chop
                 log.info(
                     "favorite ON: ask %.2f–%.2f held ≥%.1fs, T-%.0f–%.0fs, "
                     "tape %s, %s, stop bid ≤%.2f for ≥%.1fs after %.0fs, "
