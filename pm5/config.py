@@ -279,9 +279,11 @@ class Config:
     # Scale stake from MIN_FRAC at TRIGGER up to full at this ask (0 = always full).
     favorite_full_stake_ask: float = field(default_factory=lambda: _f("PM_FAVORITE_FULL_STAKE", 0.92))
     favorite_min_stake_frac: float = field(default_factory=lambda: _f("PM_FAVORITE_MIN_STAKE_FRAC", 0.50))
-    # Skip the window if our side already printed STOP, or a jump already fired.
+    # Skip if this side already printed STOP, or a jump landed in the last
+    # CHOP_SECS. A $10 wiggle at T-4 min must not ban a clean 90¢ at T-40.
     favorite_skip_chop: bool = field(default_factory=lambda: _b("PM_FAVORITE_SKIP_CHOP", True))
     favorite_chop_jumps: int = field(default_factory=lambda: _i("PM_FAVORITE_CHOP_JUMPS", 1))
+    favorite_chop_secs: float = field(default_factory=lambda: _f("PM_FAVORITE_CHOP_SECS", 15.0))
     # Sell when our bid has fallen to this (a breakdown). 0.40 is too late.
     favorite_stop: float = field(default_factory=lambda: _f("PM_FAVORITE_STOP", 0.50))
     # Bid must stay ≤ STOP this long (13/14 Sep: a one-tick 50¢ was a chop,

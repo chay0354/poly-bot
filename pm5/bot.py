@@ -179,7 +179,7 @@ class Bot:
                 else:
                     size = f"{self.cfg.favorite_shares:g} sh"
                 chop = (
-                    "skip chop (stop/jump)"
+                    f"skip chop (stop / jump ≤{self.cfg.favorite_chop_secs:.0f}s)"
                     if self.cfg.favorite_skip_chop else "chop ok"
                 )
                 log.info(
@@ -507,7 +507,10 @@ class Bot:
 
                 if favorite is not None:
                     if favorite.side is None and not position.fills:
-                        n_jumps = len(watch.records) if watch is not None else 0
+                        n_jumps = (
+                            watch.recent(self.cfg.favorite_chop_secs)
+                            if watch is not None else 0
+                        )
                         fav = favorite.evaluate(
                             up_top, down_top, fast_delta, n_jumps=n_jumps,
                         )
@@ -1038,8 +1041,13 @@ class Bot:
                 f"${self.executor.bankroll:.2f}" if self.executor.bankroll is not None else "∞",
             )
         if not position.fills and up_won is not None:
-            log.info("outcome %s | beat=%.2f close=%.2f (%s)",
-                     "UP" if up_won else "DOWN", open_price, close_price, settle_src)
+            log.info(
+                "outcome %s | beat=%s close=%s (%s)",
+                "UP" if up_won else "DOWN",
+                f"{open_price:.2f}" if open_price is not None else "?",
+                f"{close_price:.2f}" if close_price is not None else "?",
+                settle_src,
+            )
 
         self._record_window(
             market, position, witnessed, open_price, close_price, up_won, window_pnl, path or [],

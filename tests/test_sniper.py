@@ -140,6 +140,10 @@ def test_jumpwatch_ignores_small_moves_and_censors_survivors():
     now["t"] += 3.1
     w.observe(None, 120.0, -40.0, _book(0.52), _book(0.52))
     assert rec.gone_ms == 3000.0 and rec.ask_3s == 0.52
+    assert w.recent(15.0) == 1
+    now["t"] += 20.0
+    assert w.recent(15.0) == 0
+    assert w.recent(30.0) == 1
 
 
 # ---------------------------------------------------------------- Sniper

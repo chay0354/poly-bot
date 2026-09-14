@@ -263,6 +263,7 @@ def test_favorite_skips_side_that_already_printed_stop():
 
 
 def test_favorite_skips_window_after_a_jump():
+    # n_jumps is *recent* jumps (bot only counts the last CHOP_SECS).
     fav, now = _fav()
     up, dn = _book(0.90), _book(0.12)
     fav.evaluate(up, dn, 20.0, n_jumps=0)

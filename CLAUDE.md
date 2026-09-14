@@ -142,7 +142,7 @@ window (`_trade_window`) wires the pieces together:
   that has *stayed* in `[PM_FAVORITE_TRIGGER, PM_FAVORITE_MAX]` (0.88–0.95)
   for `PM_FAVORITE_HOLD` seconds in the last `PM_FAVORITE_MAX_LEFT` (90s),
   only if the fast-feed Δ already agrees. Skip the side if its bid already
-  printed STOP, or the window already jumped. Stake scales from half at
+  printed STOP, or a jump landed in the last 15s. Stake scales from half at
   0.88 to full at 0.92. The first 90¢ flicker is −EV; so is paying 0.96.
   Stop only if the bid stays ≤ `PM_FAVORITE_STOP` (0.50) for
   `PM_FAVORITE_EXIT_HOLD` after `PM_FAVORITE_EXIT_GRACE`; do not FAK under

@@ -12,8 +12,8 @@ loss. This is the version that can survive:
        still the shakeout (13/14 Sep).
     4. The tape (fast-feed Δ vs the price to beat) must already agree.
        A 90¢ Up while ETH/BTC is red is the book lying.
-    5. Skip chop: if this side already printed STOP, or the window already
-       had a jump, do not buy the bounce.
+    5. Skip chop: if this side already printed STOP, or a jump landed in
+       the last CHOP_SECS (15s), do not buy the bounce.
     6. Size: half stake at TRIGGER, full stake only at FULL_STAKE_ASK (0.92).
     7. Stop on a *persisted* breakdown: bid ≤ STOP for EXIT_HOLD seconds,
        and only after EXIT_GRACE from the fill. A one-tick 50¢ (and a tape
@@ -46,6 +46,7 @@ class Favorite:
         self._seen_at: dict[str, float | None] = {"up": None, "down": None}
         # Side already printed STOP this window — 88¢ after that is a bounce.
         self._dipped: dict[str, bool] = {"up": False, "down": False}
+        self._logged_skip = False
         self.fills: list[Fill] = []
         self.exited = False
         self.last_signal: Signal | None = None
@@ -123,12 +124,21 @@ class Favorite:
             return None
         # Watch first so a 50¢ print at T-200 still tags the side as chopped.
         self.watch(up_top, down_top)
+        left = self.market.seconds_left
+        in_band = (
+            self.cfg.favorite_min_left <= left <= self.cfg.favorite_max_left
+        )
         if (
             self.cfg.favorite_skip_chop
             and n_jumps >= self.cfg.favorite_chop_jumps
         ):
+            if in_band and not self._logged_skip:
+                log.info(
+                    "favorite skip: %d jump(s) in the last %.0fs",
+                    n_jumps, self.cfg.favorite_chop_secs,
+                )
+                self._logged_skip = True
             return None
-        left = self.market.seconds_left
         if left < self.cfg.favorite_min_left or left > self.cfg.favorite_max_left:
             return None
         now = self._clock()

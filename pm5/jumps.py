@@ -109,6 +109,13 @@ class JumpWatch:
         self._last_open: float = -1e9
         self.last: JumpRecord | None = None
 
+    def recent(self, secs: float) -> int:
+        """How many jumps landed in the last `secs` (this window)."""
+        if secs <= 0 or not self.records:
+            return 0
+        now = self._clock()
+        return sum(1 for r in self.records if now - r._t0 <= secs + 1e-9)
+
     # ------------------------------------------------------------------ tick
 
     def observe(
