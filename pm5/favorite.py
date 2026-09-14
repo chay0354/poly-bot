@@ -12,8 +12,9 @@ loss. This is the version that can survive:
        still the shakeout (13/14 Sep).
     4. The tape (fast-feed Δ vs the price to beat) must already agree.
        A 90¢ Up while ETH/BTC is red is the book lying.
-    5. Skip chop: if this side already printed STOP, or a jump landed in
-       the last CHOP_SECS (15s), do not buy the bounce.
+    5. Skip chop: if this side reached TRIGGER then printed STOP, or a
+       jump landed in the last CHOP_SECS (15s), do not buy the bounce.
+       A 50/50 open is not a STOP.
     6. Size: half stake at TRIGGER, full stake only at FULL_STAKE_ASK (0.92).
     7. Stop on a *persisted* breakdown: bid ≤ STOP for EXIT_HOLD seconds,
        and only after EXIT_GRACE from the fill. A one-tick 50¢ (and a tape
@@ -44,9 +45,12 @@ class Favorite:
         self._clock = clock
         # When each side's ask first printed ≥ trigger this window.
         self._seen_at: dict[str, float | None] = {"up": None, "down": None}
-        # Side already printed STOP this window — 88¢ after that is a bounce.
+        # Side reached TRIGGER then printed STOP — 88¢ after that is a bounce.
+        # A 50/50 open must not count (that banned almost every window).
+        self._was_rich: dict[str, bool] = {"up": False, "down": False}
         self._dipped: dict[str, bool] = {"up": False, "down": False}
         self._logged_skip = False
+        self._logged_dip: dict[str, bool] = {"up": False, "down": False}
         self.fills: list[Fill] = []
         self.exited = False
         self.last_signal: Signal | None = None
@@ -98,14 +102,21 @@ class Favorite:
     # ------------------------------------------------------------------ loop
 
     def watch(self, up_top: BookTop | None, down_top: BookTop | None) -> None:
-        """Track trigger persist and any STOP print (even before the time band)."""
+        """Track trigger persist. STOP only counts after the side was a favorite."""
         now = self._clock()
         floor = self.cfg.favorite_trigger - self.cfg.favorite_persist_give
         stop = self.cfg.favorite_stop
+        trigger = self.cfg.favorite_trigger
         for side, top in (("up", up_top), ("down", down_top)):
             ask = top.best_ask if top is not None else None
             bid = top.best_bid if top is not None else None
-            if bid is not None and bid <= stop + 1e-9:
+            if ask is not None and ask >= trigger - 1e-9:
+                self._was_rich[side] = True
+            if (
+                bid is not None
+                and bid <= stop + 1e-9
+                and self._was_rich[side]
+            ):
                 self._dipped[side] = True
             if ask is not None and ask >= floor - 1e-9:
                 if self._seen_at[side] is None:
@@ -150,6 +161,10 @@ class Favorite:
             if top is None or top.best_ask is None:
                 continue
             if self.cfg.favorite_skip_chop and self._dipped[side]:
+                if in_band and not self._logged_dip[side]:
+                    log.info("favorite skip: %s printed stop after ≥%.2f",
+                             side, self.cfg.favorite_trigger)
+                    self._logged_dip[side] = True
                 continue
             ask = top.best_ask
             if ask < lo - 1e-9 or ask > hi + 1e-9:

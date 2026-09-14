@@ -243,6 +243,17 @@ def test_favorite_skips_too_early_with_90s_band():
     assert fav.evaluate(up, dn, 20.0) is None
 
 
+def test_favorite_open_fifty_fifty_is_not_chop():
+    """A 50/50 book at the open is not 'printed STOP' — that banned every window."""
+    fav, now = _fav(favorite_stop=0.50, favorite_trigger=0.88, favorite_max_price=0.95)
+    fav.evaluate(_book(0.51, bid=0.49), _book(0.51, bid=0.49), 20.0)
+    now["t"] += 1.0
+    fav.evaluate(_book(0.90), _book(0.12), 20.0)
+    now["t"] += 2.0
+    sig = fav.evaluate(_book(0.90), _book(0.12), 20.0)
+    assert sig is not None and sig.legs[0].side == "up"
+
+
 def test_favorite_skips_side_that_already_printed_stop():
     fav, now = _fav()
     # Early dump, then the 90¢ bounce — do not buy it.
