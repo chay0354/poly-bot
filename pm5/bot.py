@@ -901,7 +901,7 @@ class Bot:
         disc = getattr(self, "discovery", None)
         if disc is None:
             return None
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + 90.0
         last: bool | None = None
         while time.monotonic() < deadline:
             last = disc.official_up_won(market.slug)
