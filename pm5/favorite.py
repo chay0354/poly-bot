@@ -8,8 +8,8 @@ loss. This is the version that can survive:
        HOLD_SECS. A one-tick 0.90 that fades is the fake-out we used to buy.
     2. Refuse asks above MAX (0.93). Winning 7¢ to risk 93¢ is the $10-to-
        make-$1 trap.
-    3. Only in the last MAX_LEFT seconds (default 90). 88¢ at T-3 min is
-       still the shakeout (13/14 Sep).
+    3. Only in the last MAX_LEFT seconds (default 150). 88¢ at T-3 min is
+       still the shakeout; T-90 is often already 0.96.
     4. The tape (fast-feed Δ vs the price to beat) must already agree.
        A 90¢ Up while ETH/BTC is red is the book lying.
     5. Skip chop: if this side reached TRIGGER then printed STOP, or a
@@ -139,9 +139,14 @@ class Favorite:
         in_band = (
             self.cfg.favorite_min_left <= left <= self.cfg.favorite_max_left
         )
+        now = self._clock()
+        hold = self.cfg.favorite_hold_secs
+        lo, hi = self.cfg.favorite_trigger, self.cfg.favorite_max_price
+        held = self._held_in_band(up_top, down_top, now, hold, lo, hi)
         if (
             self.cfg.favorite_skip_chop
             and n_jumps >= self.cfg.favorite_chop_jumps
+            and not held
         ):
             if in_band and not self._logged_skip:
                 log.info(
@@ -152,9 +157,6 @@ class Favorite:
             return None
         if left < self.cfg.favorite_min_left or left > self.cfg.favorite_max_left:
             return None
-        now = self._clock()
-        hold = self.cfg.favorite_hold_secs
-        lo, hi = self.cfg.favorite_trigger, self.cfg.favorite_max_price
         tape = self._tape_side(tape_delta)
 
         for side, top in (("up", up_top), ("down", down_top)):
@@ -269,6 +271,27 @@ class Favorite:
         )
         self.last_signal = sig
         return sig
+
+    def _held_in_band(
+        self,
+        up_top: BookTop | None,
+        down_top: BookTop | None,
+        now: float,
+        hold: float,
+        lo: float,
+        hi: float,
+    ) -> bool:
+        """True if a side's ask has already sat in [TRIGGER, MAX] for HOLD."""
+        for side, top in (("up", up_top), ("down", down_top)):
+            if top is None or top.best_ask is None:
+                continue
+            ask = top.best_ask
+            if ask < lo - 1e-9 or ask > hi + 1e-9:
+                continue
+            armed = self._seen_at[side]
+            if armed is not None and now - armed >= hold - 1e-9:
+                return True
+        return False
 
     def _stake_usdc(self, ask: float) -> float:
         """Half stake at TRIGGER, full only at FULL_STAKE_ASK. 0 ask-cap = always full."""

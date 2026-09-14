@@ -274,17 +274,24 @@ def test_favorite_skips_side_that_already_printed_stop():
 
 
 def test_favorite_skips_window_after_a_jump():
-    # n_jumps is *recent* jumps (bot only counts the last CHOP_SECS).
+    # A jump blocks only before the 88–95 ask has been held.
     fav, now = _fav()
     up, dn = _book(0.90), _book(0.12)
-    fav.evaluate(up, dn, 20.0, n_jumps=0)
-    now["t"] += 2.0
     assert fav.evaluate(up, dn, 20.0, n_jumps=1) is None
-    # Flag off: a jump does not block.
+    now["t"] += 2.0
+    assert fav.evaluate(up, dn, 20.0, n_jumps=1) is not None
     open_chop, now2 = _fav(favorite_skip_chop=False)
     open_chop.evaluate(up, dn, 20.0, n_jumps=1)
     now2["t"] += 2.0
     assert open_chop.evaluate(up, dn, 20.0, n_jumps=1) is not None
+
+
+def test_favorite_allows_t140_with_150s_band():
+    fav, now = _fav(seconds_left=140, favorite_max_left=150.0)
+    up, dn = _book(0.90), _book(0.12)
+    fav.evaluate(up, dn, 20.0)
+    now["t"] += 2.0
+    assert fav.evaluate(up, dn, 20.0) is not None
 
 
 def test_favorite_half_size_at_trigger_full_at_92():

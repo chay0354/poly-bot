@@ -274,8 +274,9 @@ class Config:
     # FOK may miss if the 90¢ ticks up one cent; allow this much chase, capped at MAX.
     favorite_chase: float = field(default_factory=lambda: _f("PM_FAVORITE_CHASE", 0.02))
     favorite_min_left: float = field(default_factory=lambda: _f("PM_FAVORITE_MIN_LEFT", 20.0))
-    # Last 90s only: 88¢ at T-3 min is still the shakeout (13/14 Sep).
-    favorite_max_left: float = field(default_factory=lambda: _f("PM_FAVORITE_MAX_LEFT", 90.0))
+    # Last 150s: 88–95¢ usually dies before T-90 (book already 0.96+).
+    # T-180 was the overnight shakeout; do not go back that far.
+    favorite_max_left: float = field(default_factory=lambda: _f("PM_FAVORITE_MAX_LEFT", 150.0))
     # Scale stake from MIN_FRAC at TRIGGER up to full at this ask (0 = always full).
     favorite_full_stake_ask: float = field(default_factory=lambda: _f("PM_FAVORITE_FULL_STAKE", 0.92))
     favorite_min_stake_frac: float = field(default_factory=lambda: _f("PM_FAVORITE_MIN_STAKE_FRAC", 0.50))
