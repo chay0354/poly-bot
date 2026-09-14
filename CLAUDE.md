@@ -139,12 +139,15 @@ window (`_trade_window`) wires the pieces together:
  `PM_SNIPE_KILL_STREAK` losing snipes in a row stand the sniper down for the
  UTC day (someone is faster; the quotes we are hitting are bait).
 - **Favorite** (`favorite.py`, `PM_FAVORITE`, off by default) — buy a side
- that has *stayed* in `[PM_FAVORITE_TRIGGER, PM_FAVORITE_MAX]` (0.88–0.95)
- for `PM_FAVORITE_HOLD` seconds in the middle-late window, only if the
- fast-feed Δ already agrees. The first 90¢ flicker is −EV; so is paying
- 0.96. If the bid then breaks to `PM_FAVORITE_STOP` (0.50) or the tape
- flips while we can still sell, FAK-sell — do not wait for 0.40. One shot
- per window; never stacked on an existing maker/snipe/momentum fill.
+  that has *stayed* in `[PM_FAVORITE_TRIGGER, PM_FAVORITE_MAX]` (0.88–0.95)
+  for `PM_FAVORITE_HOLD` seconds in the last `PM_FAVORITE_MAX_LEFT` (90s),
+  only if the fast-feed Δ already agrees. Skip the side if its bid already
+  printed STOP, or the window already jumped. Stake scales from half at
+  0.88 to full at 0.92. The first 90¢ flicker is −EV; so is paying 0.96.
+  Stop only if the bid stays ≤ `PM_FAVORITE_STOP` (0.50) for
+  `PM_FAVORITE_EXIT_HOLD` after `PM_FAVORITE_EXIT_GRACE`; do not FAK under
+  `PM_FAVORITE_EXIT_MIN_BID` (0.40). One shot per window; never stacked on
+  an existing maker/snipe/momentum fill.
 - **Daily loss limit** (`ledger.py`, `PM_DAILY_LOSS_LIMIT`) — per-UTC-day P&L
  persisted to `data/day_pnl_{mode}.json`. Live windows are *estimated*
  (`supabase_log.estimated_pnl`: pairs pay $1, exits are realized, a held leg

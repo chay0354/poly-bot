@@ -8,11 +8,14 @@ loss. This is the version that can survive:
        HOLD_SECS. A one-tick 0.90 that fades is the fake-out we used to buy.
     2. Refuse asks above MAX (0.93). Winning 7¢ to risk 93¢ is the $10-to-
        make-$1 trap.
-    3. Only in the middle-late window (enough time that 90¢ means the
-       market is resolving, enough time left to exit).
+    3. Only in the last MAX_LEFT seconds (default 90). 88¢ at T-3 min is
+       still the shakeout (13/14 Sep).
     4. The tape (fast-feed Δ vs the price to beat) must already agree.
        A 90¢ Up while ETH/BTC is red is the book lying.
-    5. Stop on a *persisted* breakdown: bid ≤ STOP for EXIT_HOLD seconds,
+    5. Skip chop: if this side already printed STOP, or the window already
+       had a jump, do not buy the bounce.
+    6. Size: half stake at TRIGGER, full stake only at FULL_STAKE_ASK (0.92).
+    7. Stop on a *persisted* breakdown: bid ≤ STOP for EXIT_HOLD seconds,
        and only after EXIT_GRACE from the fill. A one-tick 50¢ (and a tape
        flip at 80¢) was the overnight −$8 to −$16. Do not FAK under MIN_BID.
 
@@ -41,6 +44,8 @@ class Favorite:
         self._clock = clock
         # When each side's ask first printed ≥ trigger this window.
         self._seen_at: dict[str, float | None] = {"up": None, "down": None}
+        # Side already printed STOP this window — 88¢ after that is a bounce.
+        self._dipped: dict[str, bool] = {"up": False, "down": False}
         self.fills: list[Fill] = []
         self.exited = False
         self.last_signal: Signal | None = None
@@ -92,11 +97,15 @@ class Favorite:
     # ------------------------------------------------------------------ loop
 
     def watch(self, up_top: BookTop | None, down_top: BookTop | None) -> None:
-        """Track how long each side has been sitting at/above the trigger."""
+        """Track trigger persist and any STOP print (even before the time band)."""
         now = self._clock()
         floor = self.cfg.favorite_trigger - self.cfg.favorite_persist_give
+        stop = self.cfg.favorite_stop
         for side, top in (("up", up_top), ("down", down_top)):
             ask = top.best_ask if top is not None else None
+            bid = top.best_bid if top is not None else None
+            if bid is not None and bid <= stop + 1e-9:
+                self._dipped[side] = True
             if ask is not None and ask >= floor - 1e-9:
                 if self._seen_at[side] is None:
                     self._seen_at[side] = now
@@ -108,13 +117,20 @@ class Favorite:
         up_top: BookTop | None,
         down_top: BookTop | None,
         tape_delta: float | None,
+        n_jumps: int = 0,
     ) -> Signal | None:
         if not self.cfg.favorite_enabled or self.exited or self.side is not None:
+            return None
+        # Watch first so a 50¢ print at T-200 still tags the side as chopped.
+        self.watch(up_top, down_top)
+        if (
+            self.cfg.favorite_skip_chop
+            and n_jumps >= self.cfg.favorite_chop_jumps
+        ):
             return None
         left = self.market.seconds_left
         if left < self.cfg.favorite_min_left or left > self.cfg.favorite_max_left:
             return None
-        self.watch(up_top, down_top)
         now = self._clock()
         hold = self.cfg.favorite_hold_secs
         lo, hi = self.cfg.favorite_trigger, self.cfg.favorite_max_price
@@ -122,6 +138,8 @@ class Favorite:
 
         for side, top in (("up", up_top), ("down", down_top)):
             if top is None or top.best_ask is None:
+                continue
+            if self.cfg.favorite_skip_chop and self._dipped[side]:
                 continue
             ask = top.best_ask
             if ask < lo - 1e-9 or ask > hi + 1e-9:
@@ -227,9 +245,24 @@ class Favorite:
         self.last_signal = sig
         return sig
 
+    def _stake_usdc(self, ask: float) -> float:
+        """Half stake at TRIGGER, full only at FULL_STAKE_ASK. 0 ask-cap = always full."""
+        full = self.cfg.favorite_stake_usdc
+        if full <= 0:
+            return 0.0
+        hi = self.cfg.favorite_full_stake_ask
+        if hi <= 0 or ask >= hi - 1e-9:
+            return full
+        lo = self.cfg.favorite_trigger
+        min_frac = min(1.0, max(0.0, self.cfg.favorite_min_stake_frac))
+        if ask <= lo + 1e-9:
+            return round(full * min_frac, 2)
+        t = (ask - lo) / (hi - lo)
+        return round(full * (min_frac + (1.0 - min_frac) * t), 2)
+
     def _size(self, ask: float) -> tuple[float, float]:
         """(shares, stake_usdc). Stake wins when set so each fill is ~$1."""
-        stake = self.cfg.favorite_stake_usdc
+        stake = self._stake_usdc(ask)
         if stake > 0 and ask > 0:
             shares = round(stake / ask, 2)
             return shares, round(shares * ask, 2)

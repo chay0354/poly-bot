@@ -274,7 +274,14 @@ class Config:
     # FOK may miss if the 90¢ ticks up one cent; allow this much chase, capped at MAX.
     favorite_chase: float = field(default_factory=lambda: _f("PM_FAVORITE_CHASE", 0.02))
     favorite_min_left: float = field(default_factory=lambda: _f("PM_FAVORITE_MIN_LEFT", 20.0))
-    favorite_max_left: float = field(default_factory=lambda: _f("PM_FAVORITE_MAX_LEFT", 180.0))
+    # Last 90s only: 88¢ at T-3 min is still the shakeout (13/14 Sep).
+    favorite_max_left: float = field(default_factory=lambda: _f("PM_FAVORITE_MAX_LEFT", 90.0))
+    # Scale stake from MIN_FRAC at TRIGGER up to full at this ask (0 = always full).
+    favorite_full_stake_ask: float = field(default_factory=lambda: _f("PM_FAVORITE_FULL_STAKE", 0.92))
+    favorite_min_stake_frac: float = field(default_factory=lambda: _f("PM_FAVORITE_MIN_STAKE_FRAC", 0.50))
+    # Skip the window if our side already printed STOP, or a jump already fired.
+    favorite_skip_chop: bool = field(default_factory=lambda: _b("PM_FAVORITE_SKIP_CHOP", True))
+    favorite_chop_jumps: int = field(default_factory=lambda: _i("PM_FAVORITE_CHOP_JUMPS", 1))
     # Sell when our bid has fallen to this (a breakdown). 0.40 is too late.
     favorite_stop: float = field(default_factory=lambda: _f("PM_FAVORITE_STOP", 0.50))
     # Bid must stay ≤ STOP this long (13/14 Sep: a one-tick 50¢ was a chop,

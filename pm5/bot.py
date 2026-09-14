@@ -168,18 +168,29 @@ class Bot:
                     if self.cfg.snipe_enabled else "off",
                 )
             if self.cfg.favorite_enabled:
-                size = (
-                    f"${self.cfg.favorite_stake_usdc:.2f}/fill"
-                    if self.cfg.favorite_stake_usdc > 0
-                    else f"{self.cfg.favorite_shares:g} sh"
+                if self.cfg.favorite_stake_usdc > 0 and self.cfg.favorite_full_stake_ask > 0:
+                    lo = self.cfg.favorite_stake_usdc * self.cfg.favorite_min_stake_frac
+                    size = (
+                        f"${lo:.0f}–${self.cfg.favorite_stake_usdc:.0f}/fill "
+                        f"(full ≥{self.cfg.favorite_full_stake_ask:.2f})"
+                    )
+                elif self.cfg.favorite_stake_usdc > 0:
+                    size = f"${self.cfg.favorite_stake_usdc:.2f}/fill"
+                else:
+                    size = f"{self.cfg.favorite_shares:g} sh"
+                chop = (
+                    "skip chop (stop/jump)"
+                    if self.cfg.favorite_skip_chop else "chop ok"
                 )
                 log.info(
                     "favorite ON: ask %.2f–%.2f held ≥%.1fs, T-%.0f–%.0fs, "
-                    "tape %s, stop bid ≤%.2f for ≥%.1fs after %.0fs, floor %.2f, %s",
+                    "tape %s, %s, stop bid ≤%.2f for ≥%.1fs after %.0fs, "
+                    "floor %.2f, %s",
                     self.cfg.favorite_trigger, self.cfg.favorite_max_price,
                     self.cfg.favorite_hold_secs, self.cfg.favorite_min_left,
                     self.cfg.favorite_max_left,
                     (f"Δ≥${self.cfg.favorite_tape_usd:.0f}" if self.cfg.favorite_tape else "off"),
+                    chop,
                     self.cfg.favorite_stop, self.cfg.favorite_exit_hold_secs,
                     self.cfg.favorite_exit_grace_secs, self.cfg.favorite_exit_min_bid,
                     size,
@@ -496,7 +507,10 @@ class Bot:
 
                 if favorite is not None:
                     if favorite.side is None and not position.fills:
-                        fav = favorite.evaluate(up_top, down_top, fast_delta)
+                        n_jumps = len(watch.records) if watch is not None else 0
+                        fav = favorite.evaluate(
+                            up_top, down_top, fast_delta, n_jumps=n_jumps,
+                        )
                         if fav is not None:
                             fills = self._execute(fav, market)
                             if fills:

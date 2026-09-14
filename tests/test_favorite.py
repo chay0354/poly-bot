@@ -39,6 +39,10 @@ def _cfg(**kw) -> Config:
     cfg.favorite_persist_give = 0.02
     cfg.favorite_min_left = 25.0
     cfg.favorite_max_left = 120.0
+    cfg.favorite_full_stake_ask = 0.0  # tests size to the full stake
+    cfg.favorite_min_stake_frac = 0.50
+    cfg.favorite_skip_chop = True
+    cfg.favorite_chop_jumps = 1
     cfg.favorite_stop = 0.70
     cfg.favorite_exit_hold_secs = 0.0
     cfg.favorite_exit_grace_secs = 0.0
@@ -229,3 +233,96 @@ def test_favorite_one_shot_after_exit():
     up, dn = _book(0.90), _book(0.12)
     now["t"] += 3.0
     assert fav.evaluate(up, dn, 20.0) is None
+
+
+def test_favorite_skips_too_early_with_90s_band():
+    fav, now = _fav(seconds_left=100, favorite_max_left=90.0)
+    up, dn = _book(0.90), _book(0.12)
+    fav.evaluate(up, dn, 20.0)
+    now["t"] += 2.0
+    assert fav.evaluate(up, dn, 20.0) is None
+
+
+def test_favorite_skips_side_that_already_printed_stop():
+    fav, now = _fav()
+    # Early dump, then the 90¢ bounce — do not buy it.
+    fav.evaluate(_book(0.90, bid=0.50), _book(0.12), 20.0)
+    now["t"] += 2.0
+    assert fav.evaluate(_book(0.90, bid=0.88), _book(0.12), 20.0) is None
+    # Other side was never dumped and may still fire.
+    other, now2 = _fav()
+    other.evaluate(_book(0.12), _book(0.90, bid=0.50), -20.0)
+    now2["t"] += 2.0
+    assert other.evaluate(_book(0.12), _book(0.90, bid=0.88), -20.0) is None
+    # Same window, Up never printed STOP — still buyable.
+    clean, now3 = _fav()
+    clean.evaluate(_book(0.90), _book(0.12, bid=0.50), 20.0)
+    now3["t"] += 2.0
+    sig = clean.evaluate(_book(0.90), _book(0.12, bid=0.50), 20.0)
+    assert sig is not None and sig.legs[0].side == "up"
+
+
+def test_favorite_skips_window_after_a_jump():
+    fav, now = _fav()
+    up, dn = _book(0.90), _book(0.12)
+    fav.evaluate(up, dn, 20.0, n_jumps=0)
+    now["t"] += 2.0
+    assert fav.evaluate(up, dn, 20.0, n_jumps=1) is None
+    # Flag off: a jump does not block.
+    open_chop, now2 = _fav(favorite_skip_chop=False)
+    open_chop.evaluate(up, dn, 20.0, n_jumps=1)
+    now2["t"] += 2.0
+    assert open_chop.evaluate(up, dn, 20.0, n_jumps=1) is not None
+
+
+def test_favorite_half_size_at_trigger_full_at_92():
+    kw = dict(
+        favorite_stake_usdc=20.0,
+        favorite_trigger=0.88,
+        favorite_max_price=0.95,
+        favorite_full_stake_ask=0.92,
+        favorite_min_stake_frac=0.50,
+        favorite_hold_secs=0.0,
+        favorite_persist_give=0.0,
+    )
+    cheap, _ = _fav(**kw)
+    sig = cheap.evaluate(_book(0.88), _book(0.12), 20.0)
+    assert sig is not None
+    assert abs(sig.legs[0].stake_usdc - 10.0) < 0.05
+    rich, _ = _fav(**kw)
+    sig2 = rich.evaluate(_book(0.92), _book(0.12), 20.0)
+    assert sig2 is not None
+    assert abs(sig2.legs[0].stake_usdc - 20.0) < 0.05
+    mid, _ = _fav(**kw)
+    sig3 = mid.evaluate(_book(0.90), _book(0.12), 20.0)
+    assert sig3 is not None
+    assert abs(sig3.legs[0].stake_usdc - 15.0) < 0.05
+
+
+def test_favorite_replay_sep_entry_would_refuse():
+    """13/14 Sep: 88¢ at T-3 min, or after a 50¢ print, was the loser."""
+    early, now = _fav(
+        seconds_left=179,
+        favorite_max_left=90.0,
+        favorite_trigger=0.88,
+        favorite_max_price=0.95,
+        favorite_hold_secs=1.0,
+        favorite_stake_usdc=20.0,
+        favorite_full_stake_ask=0.92,
+        favorite_stop=0.50,
+    )
+    early.evaluate(_book(0.88), _book(0.12), 20.0)
+    now["t"] += 1.0
+    assert early.evaluate(_book(0.88), _book(0.12), 20.0) is None
+
+    bounce, now2 = _fav(
+        favorite_trigger=0.88,
+        favorite_max_price=0.95,
+        favorite_hold_secs=1.0,
+        favorite_stop=0.50,
+        favorite_stake_usdc=20.0,
+        favorite_full_stake_ask=0.92,
+    )
+    bounce.evaluate(_book(0.88, bid=0.48), _book(0.12), 20.0)
+    now2["t"] += 1.0
+    assert bounce.evaluate(_book(0.88, bid=0.86), _book(0.12), 20.0) is None
