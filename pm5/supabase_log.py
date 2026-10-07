@@ -175,3 +175,27 @@ class SupabaseLog:
         except Exception as e:  # noqa: BLE001
             log.warning("supabase day read failed: %s", e)
             return []
+
+    def live_open_held(self, limit: int = 40) -> list[dict[str, Any]]:
+        """Live one-sided windows still marked open (Gamma has not been written)."""
+        if self._sb is None:
+            return []
+        try:
+            res = (
+                self._sb.table("windows")
+                .select(
+                    "window_slug,ts,cost,up_shares,down_shares,up_won,estimated_pnl,result"
+                )
+                .eq("mode", "live")
+                .eq("traded", True)
+                .eq("result", "open")
+                .order("ts", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return [r for r in (res.data or []) if held_naked(
+                float(r.get("up_shares") or 0), float(r.get("down_shares") or 0),
+            )]
+        except Exception as e:  # noqa: BLE001
+            log.warning("supabase open-held read failed: %s", e)
+            return []

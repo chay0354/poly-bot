@@ -243,12 +243,54 @@ class Bot:
         from .ledger import utc_today
 
         rows = sb.live_day_windows(utc_today())
-        if not rows:
-            return
         disc = getattr(self, "discovery", None)
+        flipped = 0
+        # Same as the 14:45 14 Sep Down $12.86 win that stayed `open`:
+        # write Gamma's winner + PnL, do not leave a paid fill unmarked.
+        for row in sb.live_open_held():
+            if disc is None:
+                break
+            slug = str(row.get("window_slug") or "")
+            if not slug:
+                continue
+            try:
+                official = disc.official_up_won(slug)
+            except Exception:  # noqa: BLE001
+                official = None
+            if official is None:
+                continue
+            up = float(row.get("up_shares") or 0)
+            dn = float(row.get("down_shares") or 0)
+            cost = float(row.get("cost") or 0)
+            pnl = estimated_pnl(None, official, up, dn, cost)
+            fields = {
+                "up_won": official,
+                "estimated_pnl": pnl,
+                "result": (
+                    "win" if (pnl or 0) > 0.005
+                    else "loss" if (pnl or 0) < -0.005
+                    else "flat"
+                ),
+            }
+            try:
+                sb._sb.table("windows").update(fields).eq("mode", "live").eq(
+                    "window_slug", slug,
+                ).execute()
+                flipped += 1
+                log.info(
+                    "crm open→%s %s pnl=%s (gamma %s)",
+                    fields["result"], slug, pnl, "UP" if official else "DOWN",
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("crm open patch failed %s: %s", slug, e)
+        if flipped:
+            rows = sb.live_day_windows(utc_today())
+        if not rows:
+            if flipped:
+                log.info("settled %d open live windows from Gamma", flipped)
+            return
         total = 0.0
         n = 0
-        flipped = 0
         for row in rows:
             up = float(row.get("up_shares") or 0)
             dn = float(row.get("down_shares") or 0)
