@@ -1,24 +1,17 @@
 # Worker in Amsterdam: Polymarket's CLOB front door is London.
 # Do not switch this to a US region — Polymarket geoblocks US IPs.
+#
+# No [http_service]: Fly creates two machines for "high availability" for
+# any process with a service, and two bots would trade the same wallet.
+# Without a service there is one machine and nothing auto-stops it.
 app = "poly-bot-gvdobw"
 primary_region = "ams"
 
 [build]
   dockerfile = "Dockerfile"
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = "off"
-  auto_start_machines = true
-  min_machines_running = 1
-
-  [[http_service.checks]]
-    grace_period = "30s"
-    interval = "30s"
-    method = "GET"
-    path = "/health"
-    timeout = "5s"
+[deploy]
+  strategy = "immediate"
 
 [[vm]]
   size = "shared-cpu-1x"
