@@ -27,6 +27,19 @@ from .config import Config
 
 log = logging.getLogger("pm5.live")
 
+# Close-only or blocked on the API itself (Polymarket geoblock docs). The
+# geoblock endpoint's `blocked` also covers frontend-only countries (NL, IE)
+# where the API still accepts orders, so it cannot be the gate.
+API_BLOCKED_COUNTRIES = frozenset({
+    "IR", "SY", "CU", "KP",
+    "AU", "BY", "BE", "BI", "BR", "CF", "CD", "ET", "FR", "DE", "IQ", "IT", "LB",
+    "LY", "MM", "NZ", "NI", "PL", "RU", "SG", "SO", "SK", "SS", "SD", "TW", "TH",
+    "GB", "US", "UM", "VE", "YE", "ZW",
+})
+API_BLOCKED_REGIONS = frozenset({
+    "UA-43", "UA-14", "UA-09", "CA-BC", "CA-ON", "CA-AB", "CA-QC",
+})
+
 _BAL_RE = re.compile(r"balance:\s*(\d+)")
 _ACTIVE_RE = re.compile(r"sum of active orders:\s*(\d+)")
 
@@ -201,11 +214,13 @@ class LiveTrader:
         region = data.get("region") or "?"
         blocked = data.get("blocked")
         log.info("[LIVE] geoblock: country=%s region=%s site_blocked=%s", country, region, blocked)
-        if country in {"US", "UM"}:
+        sub = f"{country}-{region}".upper()
+        if country in API_BLOCKED_COUNTRIES or sub in API_BLOCKED_REGIONS:
             self.geoblocked = True
             log.error(
-                "[LIVE] this host is in the United States — the CLOB will 403 every order. "
-                "Move Railway to EU West (Netherlands). Do not stay on US East."
+                "[LIVE] %s is close-only or blocked on the CLOB API — no new orders from this "
+                "host. Run from an API-open region (Fly ams, Railway EU West). "
+                "https://docs.polymarket.com/developers/CLOB/geoblock", sub,
             )
 
     def _note_geoblock(self, e: Exception) -> bool:
