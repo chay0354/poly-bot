@@ -1,0 +1,25 @@
+# Worker in Amsterdam: Polymarket's CLOB front door is London.
+# Do not switch this to a US region — Polymarket geoblocks US IPs.
+app = "poly-bot-gvdobw"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

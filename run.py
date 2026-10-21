@@ -7,6 +7,8 @@ import asyncio
 import logging
 import os
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from pm5.bot import Bot
@@ -63,7 +65,36 @@ def _acquire_singleton():
     return fh
 
 
+def _serve_health() -> None:
+    """Fly's HTTP check and auto-stop need a listener. The bot itself is a worker."""
+    port = int(os.getenv("PORT", "0") or "0")
+    if port <= 0:
+        return
+
+    class _Health(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+    try:
+        httpd = ThreadingHTTPServer(("0.0.0.0", port), _Health)
+    except OSError as exc:
+        _log.warning("health port %s not bound: %s", port, exc)
+        return
+    _log.info("health check on :%s", port)
+    httpd.serve_forever()
+
+
 def main() -> None:
+    if os.getenv("PORT"):
+        threading.Thread(target=_serve_health, name="health", daemon=True).start()
     lock = _acquire_singleton()
     cfg = Config()
     cfg.require_live_creds()
