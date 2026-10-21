@@ -30,6 +30,7 @@ from .maker import MakerPair
 from .markets import WINDOW_SECS, Market, MarketDiscovery, current_window_start
 from .pricefeed import ChainlinkFeed, TwapFeed
 from .recorder import Recorder
+from .lag import LagTaker
 from .sniper import Sniper
 from .status import LiveStatus
 from .strategy import ArbitrageStrategy, MomentumStrategy, Signal
@@ -109,6 +110,8 @@ class Bot:
         # stood the sniper down for (someone is faster; the edge is gone).
         self._snipe_streak = 0
         self._snipe_stood_down_day: int | None = None
+        self._lag_streak = 0
+        self._lag_stood_down_day: int | None = None
 
     @property
     def day_pnl(self) -> float:
@@ -118,6 +121,11 @@ class Bot:
         if not self.cfg.snipe_enabled or self.cfg.mode == "signal":
             return False
         return self._snipe_stood_down_day != int(time.time() // 86400)
+
+    def _lag_allowed(self) -> bool:
+        if not self.cfg.lag_enabled or self.cfg.mode == "signal" or self.fast is None:
+            return False
+        return self._lag_stood_down_day != int(time.time() // 86400)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -166,6 +174,17 @@ class Bot:
                      f"{self.cfg.snipe_max_price:.2f}, {'scalp' if self.cfg.snipe_scalp else 'hold'}"
                      + (f", sim latency {self.cfg.sim_latency_ms:.0f}ms" if self.cfg.mode == "paper" else ""))
                     if self.cfg.snipe_enabled else "off",
+                )
+            if self.cfg.lag_enabled:
+                log.info(
+                    "lag taker ON: fair ≥%.2f, edge ≥%.2f after fee, ask %.2f–%.2f, "
+                    "T-%.0f–%.0fs, feed ≤%.0fms, %g sh%s",
+                    self.cfg.lag_min_fair, self.cfg.lag_min_edge,
+                    self.cfg.lag_min_price, self.cfg.lag_max_price,
+                    self.cfg.lag_min_left, self.cfg.lag_max_left,
+                    self.cfg.lag_max_feed_age_ms, self.cfg.lag_shares,
+                    f", sim latency {self.cfg.sim_latency_ms:.0f}ms"
+                    if self.cfg.mode == "paper" else "",
                 )
             if self.cfg.favorite_enabled:
                 if self.cfg.favorite_stake_usdc > 0 and self.cfg.favorite_full_stake_ask > 0:
@@ -408,7 +427,12 @@ class Bot:
             Favorite(self.cfg, market)
             if self.cfg.favorite_enabled and self.cfg.mode != "signal" else None
         )
-        if maker is not None or sniper is not None:
+        # Needs the beat: Δ vs an unwitnessed open is a guess, not an edge.
+        lag = (
+            LagTaker(self.cfg, self.executor, market)
+            if witnessed and self._lag_allowed() else None
+        )
+        if maker is not None or sniper is not None or lag is not None:
             self._presign(market)  # no-op if the prefetch already did it
         ticks = 0
         ws_reads0, http_reads0 = self.reader.ws_reads, self.reader.http_reads
@@ -446,6 +470,7 @@ class Bot:
                 if (
                     self.status.enabled or self.cfg.arb_enabled or sampling
                     or maker is not None or watch is not None or favorite is not None
+                    or lag is not None
                 ):
                     up_top = self.reader.top(market.up_token)
                     down_top = self.reader.top(market.down_token)
@@ -473,11 +498,14 @@ class Bot:
                             market.up_token, market.down_token,
                             next_market.up_token, next_market.down_token,
                         ])
-                        if maker is not None or sniper is not None:
+                        if maker is not None or sniper is not None or lag is not None:
                             self._presign(next_market)
 
                 fast_delta = sigma = None
-                if maker is not None or watch is not None or favorite is not None:
+                if (
+                    maker is not None or watch is not None or favorite is not None
+                    or lag is not None
+                ):
                     fast_delta = (
                         self.fast.delta_since(market.window_start)
                         if self.fast is not None else None
@@ -549,6 +577,21 @@ class Bot:
                                 sniper.mark_exited(fills)
                                 self._record_fills(market, scalp, fills, open_price)
 
+                if lag is not None:
+                    fills = lag.poll(up_top, down_top)
+                    for f in fills:
+                        position.add(f)
+                    if fills:
+                        self._record_fills(market, lag.last_signal or Signal("lag", [], ""),
+                                           fills, open_price)
+                    # Never stacked on another strategy's fill this window.
+                    if open_price is not None and all(f in lag.fills for f in position.fills):
+                        tick = self.fast.latest
+                        age_ms = (time.time() - tick.recv_ts) * 1000.0 if tick else None
+                        shot = lag.evaluate(fast_delta, sigma, age_ms, up_top, down_top)
+                        if shot is not None:
+                            lag.shoot(shot)
+
                 if favorite is not None:
                     if favorite.side is None and not position.fills:
                         n_jumps = (
@@ -612,6 +655,14 @@ class Bot:
                     self._record_fills(
                         market, sniper.last_signal or Signal("snipe", [], ""), late, open_price,
                     )
+            if lag is not None and lag.pending is not None:
+                late = self._drain_take(lag, market)
+                for f in late:
+                    position.add(f)
+                if late:
+                    self._record_fills(
+                        market, lag.last_signal or Signal("lag", [], ""), late, open_price,
+                    )
             self.executor.forget_presigned([market.up_token, market.down_token])
             elapsed = max(time.monotonic() - t_loop0, 1e-6)
             log.info(
@@ -628,8 +679,28 @@ class Bot:
                 log.info("jump study: %d jump%s recorded this window", n, "" if n == 1 else "s")
         if sniper is not None and sniper.fills:
             self._note_snipe_outcome(sniper, up_won)
+        if lag is not None and lag.fills:
+            self._note_lag_outcome(lag, up_won)
 
-    def _drain_take(self, sniper: Sniper, market: Market) -> list[Fill]:
+    def _note_lag_outcome(self, lag: LagTaker, up_won: bool | None) -> None:
+        """Kill switch: N losing lag windows in a row → off for the UTC day."""
+        if up_won is None:
+            return
+        pnl = sum(
+            f.size * (1.0 if (f.side == "up") == up_won else 0.0) - f.cost
+            for f in lag.fills
+        )
+        self._lag_streak = self._lag_streak + 1 if pnl < -0.005 else 0
+        log.info("lag window PnL %+.2f (%s) | streak %d losing",
+                 pnl, lag.summary(), self._lag_streak)
+        k = self.cfg.lag_kill_streak
+        if k > 0 and self._lag_streak >= k:
+            self._lag_stood_down_day = int(time.time() // 86400)
+            self._lag_streak = 0
+            log.warning("lag taker: %d losing windows in a row; off for the rest of the "
+                        "UTC day (the lag we buy is not there, or fair is miscalibrated)", k)
+
+    def _drain_take(self, sniper: Sniper | LagTaker, market: Market) -> list[Fill]:
         """Wait (briefly) for an in-flight take to resolve at window end."""
         pt = sniper.pending
         deadline = time.monotonic() + 3.0
@@ -685,6 +756,8 @@ class Bot:
             grids.append(MakerPair.quote_grid(self.cfg, market))
         if self._snipe_allowed():
             grids.append(Sniper.quote_grid(self.cfg, market))
+        if self._lag_allowed():
+            grids.append(LagTaker.quote_grid(self.cfg, market))
         for shares, prices in grids:
             for side in ("up", "down"):
                 self.executor.presign_bids(

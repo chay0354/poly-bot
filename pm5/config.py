@@ -257,6 +257,25 @@ class Config:
     # if the quote survived the whole way. Set it to what live shows.
     sim_latency_ms: float = field(default_factory=lambda: _f("PM_SIM_LATENCY_MS", 150.0))
 
+    # --- Lag taker (tape already decided, book still lagging) ---
+    lag_enabled: bool = field(default_factory=lambda: _b("PM_LAG", False))
+    lag_shares: float = field(default_factory=lambda: _f("PM_LAG_SHARES", 5.0))
+    # fair = P(side) from the fast-feed Δ vs the beat and the realized range.
+    lag_min_fair: float = field(default_factory=lambda: _f("PM_LAG_MIN_FAIR", 0.93))
+    # fair − ask − taker fee, per share.
+    lag_min_edge: float = field(default_factory=lambda: _f("PM_LAG_MIN_EDGE", 0.04))
+    lag_min_price: float = field(default_factory=lambda: _f("PM_LAG_MIN_PRICE", 0.60))
+    lag_max_price: float = field(default_factory=lambda: _f("PM_LAG_MAX_PRICE", 0.95))
+    lag_min_left: float = field(default_factory=lambda: _f("PM_LAG_MIN_LEFT", 5.0))
+    lag_max_left: float = field(default_factory=lambda: _f("PM_LAG_MAX_LEFT", 90.0))
+    # The last Binance/Coinbase print must be this fresh.
+    lag_max_feed_age_ms: float = field(default_factory=lambda: _f("PM_LAG_MAX_FEED_AGE_MS", 1000.0))
+    lag_per_window: int = field(default_factory=lambda: _i("PM_LAG_PER_WINDOW", 1))
+    lag_max_shots: int = field(default_factory=lambda: _i("PM_LAG_MAX_SHOTS", 3))
+    lag_retry_ms: float = field(default_factory=lambda: _f("PM_LAG_RETRY_MS", 300.0))
+    # N losing lag windows in a row → off for the UTC day. 0 = never.
+    lag_kill_streak: int = field(default_factory=lambda: _i("PM_LAG_KILL_STREAK", 3))
+
     # --- Favorite (confirmed 90¢ + breakdown exit) ---
     # Buy a side that has *stayed* at TRIGGER, not the first flicker, and
     # sell on a real breakdown (~0.70) instead of waiting for 0.40.

@@ -138,11 +138,20 @@ window (`_trade_window`) wires the pieces together:
  optional scalp (`PM_SNIPE_SCALP`) sells back at entry + `PM_SNIPE_TAKE`.
  `PM_SNIPE_KILL_STREAK` losing snipes in a row stand the sniper down for the
  UTC day (someone is faster; the quotes we are hitting are bait).
+- **Lag taker** (`lag.py`, `PM_LAG`, off by default) — the slow cousin of
+  the sniper: no jump needed. Each tick, fair = `fair_up(fast Δ vs the beat,
+  σ, left)`; in T-`PM_LAG_MAX_LEFT`…T-`PM_LAG_MIN_LEFT`, if a side's fair ≥
+  `PM_LAG_MIN_FAIR` and fair − ask − taker fee ≥ `PM_LAG_MIN_EDGE`, and the
+  last fast-feed print is ≤ `PM_LAG_MAX_FEED_AGE_MS` old, send a pre-signed
+  FAK via `Executor.take` (latency-honest in paper) and hold. Witnessed
+  windows with a known beat only; never stacked on another strategy's fill;
+  `PM_LAG_KILL_STREAK` losing windows in a row stand it down for the day.
 - **Favorite** (`favorite.py`, `PM_FAVORITE`, off by default) — buy a side
   that has *stayed* in `[PM_FAVORITE_TRIGGER, PM_FAVORITE_MAX]` (0.88–0.95)
   for `PM_FAVORITE_HOLD` seconds in the last `PM_FAVORITE_MAX_LEFT` (90s),
   only if the fast-feed Δ already agrees. Skip the side if its bid already
-  printed STOP, or a jump landed in the last 15s. Stake scales from half at
+  reached TRIGGER then printed STOP, or a jump landed in the last 15s.
+  A 50/50 open is not a stop. Stake scales from half at
   0.88 to full at 0.92. The first 90¢ flicker is −EV; so is paying 0.96.
   Stop only if the bid stays ≤ `PM_FAVORITE_STOP` (0.50) for
   `PM_FAVORITE_EXIT_HOLD` after `PM_FAVORITE_EXIT_GRACE`; do not FAK under

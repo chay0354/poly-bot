@@ -413,6 +413,9 @@ def test_reconcile_lifts_false_loss_limit():
     class _Sb:
         enabled = True
 
+        def live_open_held(self, limit=40):
+            return []
+
         def live_day_windows(self, day):
             return [{
                 "window_slug": "btc-updown-5m-1789315200",
