@@ -80,9 +80,15 @@ def test_default_thresholds_skip_thin_edges_and_rich_asks():
     assert LagTaker(cfg, Executor(cfg, reader=None), _mk(30)).evaluate(
         20.0, 100.0, 15.0, _book(0.90), _book(0.12)) is None
     # A real lag still fires: fair 0.95+ vs ask 0.82.
-    sig = LagTaker(cfg, Executor(cfg, reader=None), _mk(30)).evaluate(
-        20.0, 100.0, 15.0, _book(0.82), _book(0.20))
+    sig = LagTaker(cfg, Executor(cfg, reader=None), _mk(45)).evaluate(
+        30.0, 100.0, 15.0, _book(0.82), _book(0.20))
     assert sig is not None and sig.legs[0].side == "up"
+    # Same lag in the last 30s: the TWAP is mostly fixed, fair is not trusted.
+    assert LagTaker(cfg, Executor(cfg, reader=None), _mk(20)).evaluate(
+        30.0, 100.0, 15.0, _book(0.82), _book(0.20)) is None
+    # 15:18 21 Oct: fair 0.930 vs ask 0.82 at T-75 lost $4.10.
+    assert LagTaker(cfg, Executor(cfg, reader=None), _mk(75)).evaluate(
+        -18.1, 51.0, 15.0, _book(0.20), _book(0.82)) is None
 
 
 def test_no_shot_when_tape_has_not_decided():
