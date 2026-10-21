@@ -293,6 +293,20 @@ class Config:
     # N losing lag windows in a row → off for the UTC day. 0 = never.
     lag_kill_streak: int = field(default_factory=lambda: _i("PM_LAG_KILL_STREAK", 3))
 
+    # --- Underdog (buy the ~10¢ side late, hold) ---
+    # 1.3k btc windows Sep–Oct, ask 0.08–0.12 at T-60…30: won 22% for 0.103
+    # (+11c/share, CI +6.5…+15.7c); T-120…60 +7c. Asks ≥ 0.20 had no edge.
+    dog_enabled: bool = field(default_factory=lambda: _b("PM_UNDERDOG", False))
+    dog_min_price: float = field(default_factory=lambda: _f("PM_UNDERDOG_MIN_PRICE", 0.05))
+    dog_max_price: float = field(default_factory=lambda: _f("PM_UNDERDOG_MAX_PRICE", 0.15))
+    dog_min_left: float = field(default_factory=lambda: _f("PM_UNDERDOG_MIN_LEFT", 30.0))
+    dog_max_left: float = field(default_factory=lambda: _f("PM_UNDERDOG_MAX_LEFT", 120.0))
+    # A marketable buy under $1 notional is rejected, so size = max(5 sh, $1/price).
+    dog_min_shares: float = field(default_factory=lambda: _f("PM_UNDERDOG_MIN_SHARES", 5.0))
+    dog_min_notional: float = field(default_factory=lambda: _f("PM_UNDERDOG_MIN_NOTIONAL", 1.0))
+    dog_max_shots: int = field(default_factory=lambda: _i("PM_UNDERDOG_MAX_SHOTS", 3))
+    dog_retry_ms: float = field(default_factory=lambda: _f("PM_UNDERDOG_RETRY_MS", 300.0))
+
     # --- Favorite (confirmed 90¢ + breakdown exit) ---
     # Buy a side that has *stayed* at TRIGGER, not the first flicker, and
     # sell on a real breakdown (~0.70) instead of waiting for 0.40.

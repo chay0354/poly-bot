@@ -148,6 +148,14 @@ window (`_trade_window`) wires the pieces together:
   FAK via `Executor.take` (latency-honest in paper) and hold. Witnessed
   windows with a known beat only; never stacked on another strategy's fill;
   `PM_LAG_KILL_STREAK` losing windows in a row stand it down for the day.
+- **Underdog** (`underdog.py`, `PM_UNDERDOG`, off by default) — the mirror
+ of the favorite's losses: late books are overconfident, so a side offered
+ at `PM_UNDERDOG_MIN_PRICE`…`MAX_PRICE` (0.05–0.15) in T-120…T-30 won
+ ~2× its price in Sep–Oct data. Book-only (no beat needed, so unwitnessed
+ windows too): FAK at the ask via `Executor.take`, sized to max(5 sh, $1
+ notional) because a marketable buy under $1 is rejected; one hit per
+ window, held, never stacked on another fill. No streak kill — it loses
+ ~4 windows in 5 by design; the daily loss limit is the brake.
 - **Favorite** (`favorite.py`, `PM_FAVORITE`, off by default) — buy a side
   that has *stayed* in `[PM_FAVORITE_TRIGGER, PM_FAVORITE_MAX]` (0.88–0.95)
   for `PM_FAVORITE_HOLD` seconds in the last `PM_FAVORITE_MAX_LEFT` (90s),

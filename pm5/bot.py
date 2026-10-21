@@ -31,6 +31,7 @@ from .markets import WINDOW_SECS, Market, MarketDiscovery, current_window_start
 from .pricefeed import ChainlinkFeed, TwapFeed
 from .recorder import Recorder
 from .lag import LagTaker
+from .underdog import Underdog
 from .sniper import Sniper
 from .status import LiveStatus
 from .strategy import ArbitrageStrategy, MomentumStrategy, Signal
@@ -188,6 +189,13 @@ class Bot:
                     self.cfg.lag_max_feed_age_ms, self.cfg.lag_shares,
                     f", sim latency {self.cfg.sim_latency_ms:.0f}ms"
                     if self.cfg.mode == "paper" else "",
+                )
+            if self.cfg.dog_enabled:
+                log.info(
+                    "underdog ON: ask %.2f–%.2f at T-%.0f–%.0fs, size max(%g sh, $%.2f), hold",
+                    self.cfg.dog_min_price, self.cfg.dog_max_price,
+                    self.cfg.dog_min_left, self.cfg.dog_max_left,
+                    self.cfg.dog_min_shares, self.cfg.dog_min_notional,
                 )
             if self.cfg.favorite_enabled:
                 if self.cfg.favorite_stake_usdc > 0 and self.cfg.favorite_full_stake_ask > 0:
@@ -435,7 +443,11 @@ class Bot:
             LagTaker(self.cfg, self.executor, market)
             if witnessed and self._lag_allowed() else None
         )
-        if maker is not None or sniper is not None or lag is not None:
+        dog = (
+            Underdog(self.cfg, self.executor, market)
+            if self.cfg.dog_enabled and self.cfg.mode != "signal" else None
+        )
+        if maker is not None or sniper is not None or lag is not None or dog is not None:
             self._presign(market)  # no-op if the prefetch already did it
         ticks = 0
         ws_reads0, http_reads0 = self.reader.ws_reads, self.reader.http_reads
@@ -478,7 +490,7 @@ class Bot:
                 if (
                     self.status.enabled or self.cfg.arb_enabled or sampling
                     or maker is not None or watch is not None or favorite is not None
-                    or lag is not None
+                    or lag is not None or dog is not None
                 ):
                     up_top = self.reader.top(market.up_token)
                     down_top = self.reader.top(market.down_token)
@@ -506,7 +518,8 @@ class Bot:
                             market.up_token, market.down_token,
                             next_market.up_token, next_market.down_token,
                         ])
-                        if maker is not None or sniper is not None or lag is not None:
+                        if (maker is not None or sniper is not None or lag is not None
+                                or dog is not None):
                             self._presign(next_market)
 
                 fast_delta = sigma = None
@@ -602,6 +615,18 @@ class Bot:
                         if shot is not None:
                             lag.shoot(shot)
 
+                if dog is not None:
+                    fills = dog.poll(up_top, down_top)
+                    for f in fills:
+                        position.add(f)
+                    if fills:
+                        self._record_fills(market, dog.last_signal or Signal("underdog", [], ""),
+                                           fills, open_price)
+                    if all(f in dog.fills for f in position.fills):
+                        shot = dog.evaluate(up_top, down_top)
+                        if shot is not None:
+                            dog.shoot(shot)
+
                 if favorite is not None:
                     if favorite.side is None and not position.fills:
                         n_jumps = (
@@ -673,6 +698,14 @@ class Bot:
                     self._record_fills(
                         market, lag.last_signal or Signal("lag", [], ""), late, open_price,
                     )
+            if dog is not None and dog.pending is not None:
+                late = self._drain_take(dog, market)
+                for f in late:
+                    position.add(f)
+                if late:
+                    self._record_fills(
+                        market, dog.last_signal or Signal("underdog", [], ""), late, open_price,
+                    )
             self.executor.forget_presigned([market.up_token, market.down_token])
             elapsed = max(time.monotonic() - t_loop0, 1e-6)
             log.info(
@@ -710,7 +743,7 @@ class Bot:
             log.warning("lag taker: %d losing windows in a row; off for the rest of the "
                         "UTC day (the lag we buy is not there, or fair is miscalibrated)", k)
 
-    def _drain_take(self, sniper: Sniper | LagTaker, market: Market) -> list[Fill]:
+    def _drain_take(self, sniper: Sniper | LagTaker | Underdog, market: Market) -> list[Fill]:
         """Wait (briefly) for an in-flight take to resolve at window end."""
         pt = sniper.pending
         deadline = time.monotonic() + 3.0
@@ -768,6 +801,8 @@ class Bot:
             grids.append(Sniper.quote_grid(self.cfg, market))
         if self._lag_allowed():
             grids.append(LagTaker.quote_grid(self.cfg, market))
+        if self.cfg.dog_enabled:
+            grids.extend(Underdog.quote_grid(self.cfg, market))
         for shares, prices in grids:
             for side in ("up", "down"):
                 self.executor.presign_bids(
