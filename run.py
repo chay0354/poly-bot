@@ -13,7 +13,9 @@ from pm5.bot import Bot
 from pm5.config import Config
 from pm5.status import LiveStatus
 
-_LOCK_PATH = Path("data/bot.lock")
+# One process per asset: btc keeps the original lock, others get their own.
+_ASSET = os.getenv("PM_ASSET", "btc").strip().lower()
+_LOCK_PATH = Path("data/bot.lock" if _ASSET == "btc" else f"data/bot-{_ASSET}.lock")
 _log = logging.getLogger("pm5")
 
 
@@ -30,7 +32,7 @@ class _StatusAwareHandler(logging.StreamHandler):
 
 
 def _acquire_singleton():
-    """One live/paper process at a time. A second `run.py` exits immediately."""
+    """One live/paper process per asset. A second `run.py` exits immediately."""
     _LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     fh = _LOCK_PATH.open("a+b")
     if fh.tell() == 0:

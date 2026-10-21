@@ -41,6 +41,13 @@ ASSET_PRESETS: dict[str, dict] = {
         "coinbase_product": "ETH-USD",
         "jump_min_usd": 3.0,
     },
+    "sol": {
+        "slug_prefix": "sol-updown-5m",
+        "symbol": "sol/usd",
+        "binance_url": "wss://stream.binance.com:9443/ws/solusdt@aggTrade",
+        "coinbase_product": "SOL-USD",
+        "jump_min_usd": 0.15,
+    },
 }
 
 
@@ -51,7 +58,7 @@ class Config:
     # paper  = simulate fills against the live order book, no real money.
     # live   = sign and post real orders via the CLOB.
     mode: str = field(default_factory=lambda: os.getenv("PM_MODE", "signal").lower())
-    # Which 5-minute Up/Down market: btc (default) or eth.
+    # Which 5-minute Up/Down market: btc (default), eth or sol.
     asset: str = field(default_factory=lambda: os.getenv("PM_ASSET", "btc").strip().lower())
     slug_prefix: str = ""
     chainlink_symbol: str = ""
@@ -360,10 +367,15 @@ class Config:
         self.chainlink_symbol = preset["symbol"]
         self.coinbase_product = preset["coinbase_product"]
         url = os.getenv("PM_FAST_FEED_URL")
-        if url is None or any(s in self.fast_feed_url for s in ("btcusdt", "ethusdt")):
+        if url is None or any(s in self.fast_feed_url for s in ("btcusdt", "ethusdt", "solusdt")):
             self.fast_feed_url = preset["binance_url"]
         if os.getenv("PM_JUMP_MIN_USD") is None:
             self.jump_min_usd = preset["jump_min_usd"]
+        # One process per asset can run side by side; each keeps its own
+        # ledger file (btc keeps the original name). The loss limit is still
+        # shared: `_reconcile_day_ledger` sums every live window in the CRM.
+        if os.getenv("PM_DAY_PNL_FILE") is None and self.asset != "btc":
+            self.day_pnl_file = f"data/day_pnl_{{mode}}_{self.asset}.json"
         if self.favorite_loose:
             self.favorite_trigger = 0.85
             self.favorite_max_price = 0.97
