@@ -141,7 +141,9 @@ window (`_trade_window`) wires the pieces together:
 - **Lag taker** (`lag.py`, `PM_LAG`, off by default) — the slow cousin of
   the sniper: no jump needed. Each tick, fair = `fair_up(fast Δ vs the beat,
   σ, left)`; in T-`PM_LAG_MAX_LEFT`…T-`PM_LAG_MIN_LEFT`, if a side's fair ≥
-  `PM_LAG_MIN_FAIR` and fair − ask − taker fee ≥ `PM_LAG_MIN_EDGE`, and the
+  `PM_LAG_MIN_FAIR` and min(fair, `PM_LAG_FAIR_CAP`) − ask − taker fee ≥
+  `PM_LAG_MIN_EDGE` (fair_up is overconfident at the top: "≥0.97" won 93%,
+  asks > 0.90 had no edge), and the
   last fast-feed print is ≤ `PM_LAG_MAX_FEED_AGE_MS` old, send a pre-signed
   FAK via `Executor.take` (latency-honest in paper) and hold. Witnessed
   windows with a known beat only; never stacked on another strategy's fill;

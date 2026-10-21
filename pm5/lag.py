@@ -7,7 +7,8 @@ window is all but settled, yet the Polymarket ask still prices it as
 merely likely.
 
     fair = fair_up(Δ since the beat, realized 5-min range, time left)
-    fair ≥ MIN_FAIR, fair − ask − taker fee ≥ MIN_EDGE, feed print fresh
+    fair ≥ MIN_FAIR, min(fair, FAIR_CAP) − ask − taker fee ≥ MIN_EDGE,
+    feed print fresh
     →  FAK buy at that ask (pre-signed when possible), hold to resolution
 
 Small edge per trade, so it only pays with a high hit rate. Paper is
@@ -122,7 +123,7 @@ class LagTaker:
             if ask < cfg.lag_min_price - 1e-9 or ask > cfg.lag_max_price + 1e-9:
                 continue
             fee = taker_fee_usdc(1.0, ask, cfg.taker_fee_rate)
-            edge = fair - ask - fee
+            edge = min(fair, cfg.lag_fair_cap) - ask - fee
             if edge < cfg.lag_min_edge - 1e-9:
                 continue
             shares = cfg.lag_shares

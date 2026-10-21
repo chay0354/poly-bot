@@ -68,6 +68,23 @@ def test_no_shot_when_book_already_caught_up():
         20.0, 100.0, 50.0, _book(0.96), _book(0.05)) is None
 
 
+def test_default_thresholds_skip_thin_edges_and_rich_asks():
+    cfg = Config()
+    cfg.mode = "paper"
+    cfg.paper_bankroll = 0.0
+    cfg.lag_enabled = True
+    # 13:28 21 Oct: fair 0.934 vs ask 0.87 (5.6¢ after fee) lost $8.70.
+    assert LagTaker(cfg, Executor(cfg, reader=None), _mk(75)).evaluate(
+        -28.9, 80.0, 15.0, _book(0.14), _book(0.87)) is None
+    # fair ≈ 0.99 is priced as FAIR_CAP 0.95: ask 0.90 is under 8¢ edge.
+    assert LagTaker(cfg, Executor(cfg, reader=None), _mk(30)).evaluate(
+        20.0, 100.0, 15.0, _book(0.90), _book(0.12)) is None
+    # A real lag still fires: fair 0.95+ vs ask 0.82.
+    sig = LagTaker(cfg, Executor(cfg, reader=None), _mk(30)).evaluate(
+        20.0, 100.0, 15.0, _book(0.82), _book(0.20))
+    assert sig is not None and sig.legs[0].side == "up"
+
+
 def test_no_shot_when_tape_has_not_decided():
     # $5 over the beat on a $300 range: fair well under 0.93.
     assert _lag().evaluate(5.0, 300.0, 50.0, _book(0.70), _book(0.32)) is None

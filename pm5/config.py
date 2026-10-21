@@ -262,10 +262,14 @@ class Config:
     lag_shares: float = field(default_factory=lambda: _f("PM_LAG_SHARES", 5.0))
     # fair = P(side) from the fast-feed Δ vs the beat and the realized range.
     lag_min_fair: float = field(default_factory=lambda: _f("PM_LAG_MIN_FAIR", 0.93))
-    # fair − ask − taker fee, per share.
-    lag_min_edge: float = field(default_factory=lambda: _f("PM_LAG_MIN_EDGE", 0.04))
+    # fair − ask − taker fee, per share (fair capped at FAIR_CAP).
+    lag_min_edge: float = field(default_factory=lambda: _f("PM_LAG_MIN_EDGE", 0.08))
+    # fair_up is overconfident at the top: on 3.4k settled jumps, "≥0.97"
+    # won 93% and "0.93–0.97" won 91%. Price the edge off at most this.
+    lag_fair_cap: float = field(default_factory=lambda: _f("PM_LAG_FAIR_CAP", 0.95))
     lag_min_price: float = field(default_factory=lambda: _f("PM_LAG_MIN_PRICE", 0.60))
-    lag_max_price: float = field(default_factory=lambda: _f("PM_LAG_MAX_PRICE", 0.95))
+    # Asks above 0.90 earned +0.8¢/share on the same data: no edge.
+    lag_max_price: float = field(default_factory=lambda: _f("PM_LAG_MAX_PRICE", 0.90))
     lag_min_left: float = field(default_factory=lambda: _f("PM_LAG_MIN_LEFT", 5.0))
     lag_max_left: float = field(default_factory=lambda: _f("PM_LAG_MAX_LEFT", 90.0))
     # The last Binance/Coinbase print must be this fresh.
