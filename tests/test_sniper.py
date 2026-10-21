@@ -312,6 +312,75 @@ def test_resolution_prefers_the_twap_stream():
     assert asyncio.run(bot._close_ref(m)) == (100.2, "spot")
 
 
+def test_open_ref_rejects_a_frozen_twap_stream():
+    """eth 21 Oct: the TWAP subscription went silent at 14:42 and its last
+    value was used as the beat for four windows; two live trades lost."""
+    from pm5.bot import Bot
+
+    bot = Bot.__new__(Bot)
+    bot.cfg = _cfg()
+    m = _mk(seconds_left=200)  # 100s in
+    ws = m.window_start
+    bot.feed = type("F", (), {
+        "latest": Tick(price=100.0, src_ts=ws, recv_ts=ws),
+        "price_at_or_after": lambda self, ts: 100.0,
+        "witnessed_open": lambda self, ts: True,
+    })()
+    bot.twap_feed = _twap_feed([(ws - 900, 98.0)])
+    assert bot._open_ref(m) == (None, "twap-stale")
+    # A live stream stamped within a few seconds of the open is the beat.
+    bot.twap_feed = _twap_feed([(ws - 900, 98.0), (ws - 1, 99.5)])
+    assert bot._open_ref(m) == (99.5, "twap60")
+
+
+def test_feed_reconnects_when_its_symbol_goes_silent():
+    from pm5.pricefeed import ChainlinkFeed
+
+    class _WS:
+        def __init__(self):
+            self.frames = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def send(self, _):
+            pass
+
+        async def recv(self):
+            await asyncio.sleep(0)
+            self.frames += 1
+            # Only other symbols arrive: the socket is busy, ours is dead.
+            return json.dumps({"topic": "crypto_prices_chainlink", "payload": {
+                "symbol": "sol/usd", "value": 1.0, "timestamp": 1}})
+
+    import pm5.pricefeed as pf
+
+    f = ChainlinkFeed("wss://x", "x", symbol="eth/usd")
+    f.SILENCE_SECS = 0.05
+    conns = []
+
+    def connect(*a, **k):
+        conns.append(1)
+        if len(conns) > 1:
+            raise asyncio.CancelledError
+        return _WS()
+
+    orig = pf.websockets.connect
+    pf.websockets.connect = connect
+    try:
+        try:
+            asyncio.run(asyncio.wait_for(f.run(), timeout=5))
+        except asyncio.CancelledError:
+            pass
+    finally:
+        pf.websockets.connect = orig
+    assert len(conns) == 2  # dropped the silent socket and reconnected
+    assert f.latest is None
+
+
 def test_close_ref_does_not_reuse_the_open_twap_as_the_close():
     """7:10 live 13 Sep: only the open TWAP was in history, close == open,
     we labelled Up and booked −$1 on a Down that paid."""

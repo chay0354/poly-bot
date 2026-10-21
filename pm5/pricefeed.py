@@ -108,6 +108,8 @@ class ChainlinkFeed:
     SYMBOL = "btc/usd"
     TOPIC = "crypto_prices_chainlink"
     NAME = "price feed"
+    # Reconnect when our symbol has been silent this long (updates are ~1/s).
+    SILENCE_SECS = 30.0
     SUBSCRIBE = {
         "action": "subscribe",
         "subscriptions": [{"topic": "crypto_prices_chainlink", "type": "update"}],
@@ -122,6 +124,7 @@ class ChainlinkFeed:
         self._history_secs = history_secs
         self.SYMBOL = symbol
         self.latest: Tick | None = None
+        self._last_own = time.time()
         self._history: list[Tick] = []
         self._first_src_ts: float | None = None
         self._connected = asyncio.Event()
@@ -138,9 +141,22 @@ class ChainlinkFeed:
                     await ws.send(json.dumps(self.SUBSCRIBE))
                     self._connected.set()
                     backoff = 1.0
+                    self._last_own = time.time()
                     log.info("%s connected", self.NAME)
-                    async for raw in ws:
-                        self._ingest(raw)
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            raw = None
+                        if raw is not None:
+                            self._ingest(raw)
+                        # Other symbols keep the socket busy, so a dead
+                        # subscription for ours never errors (eth/usd TWAP
+                        # froze at 14:42 on 21 Oct and fed a stale beat).
+                        if time.time() - self._last_own > self.SILENCE_SECS:
+                            raise RuntimeError(
+                                f"no {self.SYMBOL} update for {self.SILENCE_SECS:.0f}s"
+                            )
             except Exception as e:  # noqa: BLE001 - reconnect on anything
                 self._connected.clear()
                 log.warning("%s disconnected (%s); reconnecting in %.0fs", self.NAME, e, backoff)
@@ -166,6 +182,7 @@ class ChainlinkFeed:
         src_ts = float(payload.get("timestamp", 0)) / 1000.0 or time.time()
         tick = Tick(price=price, src_ts=src_ts, recv_ts=time.time())
         self.latest = tick
+        self._last_own = tick.recv_ts
         if self._first_src_ts is None:
             self._first_src_ts = src_ts
         self._history.append(tick)

@@ -62,6 +62,9 @@ class Position:
 
 
 class Bot:
+    # The TWAP update used as the beat must be stamped this close to the open.
+    TWAP_OPEN_MAX_AGE = 10.0
+
     def __init__(self, cfg: Config, status: LiveStatus | None = None) -> None:
         self.cfg = cfg
         self.status = status or LiveStatus(enabled=False)
@@ -446,6 +449,11 @@ class Bot:
 
                 if witnessed and open_price is None:
                     open_price, src = self._open_ref(market)
+                    if src == "twap-stale" and "twap-stale" not in self._window_logged:
+                        self._window_logged.add("twap-stale")
+                        log.warning("TWAP stream stale at the open (last stamp %.0f, open %d); "
+                                    "no price to beat, no trades this window",
+                                    self.twap_feed.latest.src_ts, market.window_start)
                     if open_price is not None:
                         # The fast feeds measure Δ from *their* print at the
                         # open; the market measures from the 60s TWAP at the
@@ -1040,9 +1048,14 @@ class Bot:
             tf = self.twap_feed
             if tf.latest.src_ts < market.window_start and market.seconds_in < 10:
                 return None, "twap60"  # the tick stamped at the open is still in flight
-            v = tf.value_at(market.window_start)
-            if v is not None:
-                return v, "twap60"
+            tick = tf.tick_at(market.window_start)
+            if tick is not None:
+                if tick.src_ts < market.window_start - self.TWAP_OPEN_MAX_AGE:
+                    # A frozen stream's last value is not this window's beat
+                    # (eth 21 Oct: one 14:42 value used for four windows).
+                    # No beat → no Δ-based trade this window.
+                    return None, "twap-stale"
+                return tick.price, "twap60"
         return self.feed.price_at_or_after(market.window_start), "spot"
 
     async def _close_ref(self, market: Market) -> tuple[float | None, str]:
