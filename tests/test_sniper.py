@@ -189,6 +189,16 @@ def test_sniper_skips_without_edge_or_size_or_freshness():
     assert sn.evaluate(rec, j.age * 1000, up, dn) is None
 
 
+def test_sniper_edge_is_net_of_the_taker_fee():
+    cfg, ex, m, w, sn, rec, j, up, dn, now = _armed()
+    ask = round(rec.fair_after - 0.07, 2)
+    fee = 0.07 * ask * (1 - ask)
+    stale = _book(ask, asks=[(ask, 20.0)])
+    # 7c raw edge clears a 6c bar only before the ~1.7c fee is paid.
+    assert rec.fair_after - ask >= 0.06 and rec.fair_after - ask - fee < 0.06
+    assert sn.evaluate(rec, j.age * 1000, stale, dn) is None
+
+
 def test_sniper_respects_window_band_and_no_sigma():
     cfg, ex, m, w, sn, rec, j, up, dn, now = _armed(seconds_left=10)
     assert sn.evaluate(rec, j.age * 1000, up, dn) is None  # < min_left

@@ -570,10 +570,12 @@ class Bot:
                                 market, sniper.last_signal or Signal("snipe", [], ""),
                                 fills, open_price,
                             )
-                        shot = sniper.evaluate(
-                            watch.last, jump.age * 1000.0 if jump is not None else None,
-                            up_top, down_top,
-                        )
+                        shot = None
+                        if all(f in sniper.fills for f in position.fills):
+                            shot = sniper.evaluate(
+                                watch.last, jump.age * 1000.0 if jump is not None else None,
+                                up_top, down_top,
+                            )
                         if shot is not None:
                             sniper.shoot(shot, watch.last)
                         scalp = sniper.exit_signal(up_top, down_top)

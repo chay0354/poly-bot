@@ -128,7 +128,7 @@ window (`_trade_window`) wires the pieces together:
  no longer fits (`BookTop.offered_at`), plus the ask at 1s/3s and the outcome,
  appending one line per jump to `data/jumps.jsonl`. **The sniper is gated on
  that study** (`PM_SNIPE`, off by default): `Sniper.evaluate` fires once per
- jump when fair_after − ask ≥ `PM_SNIPE_MIN_EDGE`, the offered size covers
+ jump when fair_after − ask − taker fee ≥ `PM_SNIPE_MIN_EDGE` (0.08), the offered size covers
  `PM_SNIPE_SHARES`, and the jump is < `PM_SNIPE_MAX_AGE_MS` old; the buy is a
  pre-signed FAK sent off-thread (`Executor.take` → `PendingTake`, read back by
  `poll_take` on later ticks, never blocking the loop). **Paper is

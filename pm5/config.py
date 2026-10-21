@@ -240,7 +240,9 @@ class Config:
     # jump study says stale quotes outlive our round trip.
     snipe_enabled: bool = field(default_factory=lambda: _b("PM_SNIPE", False))
     snipe_shares: float = field(default_factory=lambda: _f("PM_SNIPE_SHARES", 5.0))
-    snipe_min_edge: float = field(default_factory=lambda: _f("PM_SNIPE_MIN_EDGE", 0.06))
+    # Edge is fair_after − ask − taker fee. Jump study Sep–Oct (btc, first
+    # qualifying jump per window, quote alive ≥300ms): ≥0.08 → +13c/share.
+    snipe_min_edge: float = field(default_factory=lambda: _f("PM_SNIPE_MIN_EDGE", 0.08))
     # The jump must be this fresh (ms since the print) — older and the book
     # has had time to reprice; whatever is still offered is offered on purpose.
     snipe_max_age_ms: float = field(default_factory=lambda: _f("PM_SNIPE_MAX_AGE_MS", 800.0))

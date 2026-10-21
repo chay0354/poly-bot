@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import time
 
-from .clob import BookTop, Executor, Fill, PendingTake
+from .clob import BookTop, Executor, Fill, PendingTake, taker_fee_usdc
 from .config import Config
 from .jumps import JumpRecord
 from .markets import Market
@@ -129,7 +129,7 @@ class Sniper:
         ask = top.best_ask
         if ask < self.cfg.snipe_min_price or ask > self.cfg.snipe_max_price:
             return None
-        edge = rec.fair_after - ask
+        edge = rec.fair_after - ask - taker_fee_usdc(1.0, ask, self.cfg.taker_fee_rate)
         if edge < self.cfg.snipe_min_edge - 1e-9:
             return None
         shares = self.cfg.snipe_shares
