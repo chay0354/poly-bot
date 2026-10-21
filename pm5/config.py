@@ -246,9 +246,9 @@ class Config:
     # The jump must be this fresh (ms since the print) — older and the book
     # has had time to reprice; whatever is still offered is offered on purpose.
     snipe_max_age_ms: float = field(default_factory=lambda: _f("PM_SNIPE_MAX_AGE_MS", 800.0))
-    # Price band for the ask we hit: dust under MIN is unfillable noise,
-    # above MAX the fee and the downside eat the edge.
-    snipe_min_price: float = field(default_factory=lambda: _f("PM_SNIPE_MIN_PRICE", 0.10))
+    # Price band for the ask we hit: a marketable buy under $1 notional is
+    # rejected (5 sh needs ≥ 0.20), above MAX the fee and the downside eat the edge.
+    snipe_min_price: float = field(default_factory=lambda: _f("PM_SNIPE_MIN_PRICE", 0.20))
     snipe_max_price: float = field(default_factory=lambda: _f("PM_SNIPE_MAX_PRICE", 0.85))
     # Only inside this part of the window: not while the book is still being
     # built, not in the final seconds.
