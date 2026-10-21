@@ -398,8 +398,8 @@ class LiveTrader:
             if not self._note_geoblock(e):
                 if "not enough balance" in str(e):
                     self._note_reject(e, pt.shares * pt.price)
-                log.error("[LIVE] take %s @ %.2f failed: %s", pt.side, pt.price, e)
-            pt.reason = f"rejected: {e}"
+                log.error("[LIVE] take %s @ %.2f failed after %.0fms: %s", pt.side, pt.price, ms, e)
+            pt.reason = f"rejected after {ms:.0f}ms: {e}"
             return None
         if not isinstance(resp, dict):
             pt.reason = f"unexpected response {resp!r}"
