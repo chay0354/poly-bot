@@ -156,6 +156,14 @@ window (`_trade_window`) wires the pieces together:
  notional) because a marketable buy under $1 is rejected; one hit per
  window, held, never stacked on another fill. No streak kill — it loses
  ~4 windows in 5 by design; the daily loss limit is the brake.
+- **Martingale** (`martingale.py`, `PM_MART`, off by default) — the
+ owner's rule, no edge: one marketable buy per window while the chosen
+ side's ask is 0.40–0.60, stakes walk `PM_MART_STAKES` (1/2/4/8; win →
+ first stake, loss → next, last loss → start over). Side = the rarer of
+ the two 4-window patterns that continue the last three official
+ outcomes over `PM_MART_LOOKBACK` windows (Gamma, `closed=true`, plus our
+ own settlement). No bet until the previous bet's outcome is known. $1
+ is the floor: a marketable buy under $1 notional is rejected.
 - **Favorite** (`favorite.py`, `PM_FAVORITE`, off by default) — buy a side
   that has *stayed* in `[PM_FAVORITE_TRIGGER, PM_FAVORITE_MAX]` (0.88–0.95)
   for `PM_FAVORITE_HOLD` seconds in the last `PM_FAVORITE_MAX_LEFT` (90s),

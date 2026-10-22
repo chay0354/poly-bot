@@ -13,10 +13,10 @@ primary_region = "ams"
 [deploy]
   strategy = "immediate"
 
-# The liquidity-rewards maker replaces the 5-minute bot on this wallet.
 # Keep the group named "app" so the existing machine is updated in place.
+# One bot per wallet: run.py (5-minute strategies) or rewards_run.py --live.
 [processes]
-  app = "python -u rewards_run.py --live"
+  app = "python -u run.py"
 
 [[vm]]
   size = "shared-cpu-1x"

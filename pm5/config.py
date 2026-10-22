@@ -307,6 +307,18 @@ class Config:
     dog_max_shots: int = field(default_factory=lambda: _i("PM_UNDERDOG_MAX_SHOTS", 3))
     dog_retry_ms: float = field(default_factory=lambda: _f("PM_UNDERDOG_RETRY_MS", 300.0))
 
+    # --- Martingale (owner's rule: no edge; the ladder caps the loss) ---
+    mart_enabled: bool = field(default_factory=lambda: _b("PM_MART", False))
+    mart_stakes: list = field(default_factory=lambda: [
+        float(x) for x in os.getenv("PM_MART_STAKES", "1,2,4,8").split(",") if x.strip()])
+    mart_min_price: float = field(default_factory=lambda: _f("PM_MART_MIN_PRICE", 0.40))
+    mart_max_price: float = field(default_factory=lambda: _f("PM_MART_MAX_PRICE", 0.60))
+    mart_min_left: float = field(default_factory=lambda: _f("PM_MART_MIN_LEFT", 30.0))
+    mart_max_left: float = field(default_factory=lambda: _f("PM_MART_MAX_LEFT", 290.0))
+    mart_lookback: int = field(default_factory=lambda: _i("PM_MART_LOOKBACK", 288))
+    mart_max_shots: int = field(default_factory=lambda: _i("PM_MART_MAX_SHOTS", 5))
+    mart_retry_ms: float = field(default_factory=lambda: _f("PM_MART_RETRY_MS", 1000.0))
+
     # --- Liquidity-rewards maker (rewards_run.py; not part of run.py) ---
     rw_budget: float = field(default_factory=lambda: _f("PM_RW_BUDGET", 20.0))
     rw_max_markets: int = field(default_factory=lambda: _i("PM_RW_MAX_MARKETS", 2))
