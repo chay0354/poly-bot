@@ -316,6 +316,7 @@ class Config:
     mart_min_left: float = field(default_factory=lambda: _f("PM_MART_MIN_LEFT", 30.0))
     mart_max_left: float = field(default_factory=lambda: _f("PM_MART_MAX_LEFT", 290.0))
     mart_lookback: int = field(default_factory=lambda: _i("PM_MART_LOOKBACK", 288))
+    mart_start_step: int = field(default_factory=lambda: _i("PM_MART_START_STEP", 0))
     mart_max_shots: int = field(default_factory=lambda: _i("PM_MART_MAX_SHOTS", 5))
     mart_retry_ms: float = field(default_factory=lambda: _f("PM_MART_RETRY_MS", 1000.0))
 

@@ -46,9 +46,16 @@ def _cfg(**kw):
     return cfg
 
 
-def test_shares_cover_the_stake():
-    assert mart_shares(1, 0.51) * 0.51 >= 1
-    assert mart_shares(8, 0.47) * 0.47 >= 8
+def test_shares_cover_the_stake_in_whole_cents():
+    for stake in (1, 2, 4, 8):
+        for c in range(40, 61):
+            p = c / 100
+            n = mart_shares(stake, p)
+            assert n * p >= stake - 1e-9
+            assert abs(round(n * p, 2) - n * p) < 1e-9
+            assert n * p < stake + p + 1e-9  # at most one extra share
+    assert mart_shares(1, 0.40) == 2.5
+    assert mart_shares(1, 0.42) == 2.5
 
 
 def test_pick_side_bets_the_rarer_continuation():

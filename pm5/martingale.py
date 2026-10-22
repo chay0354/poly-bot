@@ -34,9 +34,14 @@ log = logging.getLogger("pm5.martingale")
 
 
 def mart_shares(stake: float, price: float) -> float:
-    """Shares for `stake` dollars at `price`, never under the stake (the CLOB
-    rejects a marketable buy below $1 notional)."""
-    return math.ceil(stake / price * 100 - 1e-9) / 100
+    """Fewest shares (in 0.01s) costing ≥ `stake` at `price` whose cost is a
+    whole number of cents: the CLOB rejects a marketable buy under $1 and a
+    buy whose USDC amount has more than 2 decimals (2.39 × 0.42 = 1.0038)."""
+    cents = round(price * 100)
+    n = math.ceil(stake / price * 100 - 1e-9)
+    while cents > 0 and (n * cents) % 100:
+        n += 1
+    return n / 100
 
 
 def pick_side(history: list[bool], last3: list[bool]) -> tuple[str, int, int]:
@@ -65,7 +70,8 @@ class Martingale:
         self.outcomes: dict[int, bool] = {}  # window_start → Up won (official)
         self._lock = threading.Lock()
         self._fetching: set[int] = set()
-        self.step = 0
+        # A restart forgets the ladder; PM_MART_START_STEP resumes it.
+        self.step = min(max(cfg.mart_start_step, 0), len(cfg.mart_stakes) - 1)
         self.bet_window: int | None = None  # window of the bet awaiting its result
         self.bet_side: str | None = None
         # Per window:
