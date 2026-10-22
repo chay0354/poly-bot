@@ -23,7 +23,7 @@ from pm5.clob import BookReader
 from pm5.config import Config
 from pm5.supabase_log import SupabaseLog
 from pm5.rewards import (
-    MarketQuoter, capital_needed, est_daily, fetch_reward_markets, fill_market_details,
+    MarketQuoter, book_daily, capital_needed, fetch_reward_markets, fill_market_details,
     parse_markets, quote_distance_c, quote_prices, rank,
 )
 
@@ -53,27 +53,45 @@ def _lock():
     return fh
 
 
-def choose(cfg: Config, http: httpx.Client, budget: float, reader: BookReader):
+STICKY = 1.5  # a market we already quote must be beaten by this factor
+
+
+def choose(cfg: Config, http: httpx.Client, budget: float, reader: BookReader,
+           current: dict | None = None):
+    """Best markets by expected USDC/day against their live books.
+    `current` = {condition_id: MarketQuoter} we already quote."""
+    current = current or {}
     raw = fetch_reward_markets(cfg.clob_url, http)
     markets = parse_markets(raw)
-    out, left = [], budget
-    tried = 0
+    scored, tried = [], 0
     for m in rank(cfg, markets):
-        if len(out) >= cfg.rw_max_markets or tried >= 60:
+        if tried >= 60:
             break
-        if capital_needed(cfg, m) > left + 1e-9:
+        if capital_needed(cfg, m) > budget + 1e-9:
             continue
         tried += 1
-        if not fill_market_details(cfg.clob_url, m, http):
+        q = current.get(m.condition_id)
+        if q is not None:
+            m = q.m
+        elif not fill_market_details(cfg.clob_url, m, http):
             continue
         top = reader.top(m.yes_token)
-        if quote_prices(cfg, m, top.best_bid, top.best_ask) is None:
+        daily = book_daily(cfg, m, top, q.mine() if q is not None else ())
+        if daily <= 0:
             continue
-        need = capital_needed(cfg, m)  # tick size may have changed it
+        scored.append((daily * (STICKY if q is not None else 1.0), daily, m))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out, left = [], budget
+    for _, daily, m in scored:
+        if len(out) >= cfg.rw_max_markets:
+            break
+        need = capital_needed(cfg, m)
         if need <= left + 1e-9:
             out.append(m)
             left -= need
-    log.info("%d reward markets, %d picked for $%.2f", len(markets), len(out), budget)
+            log.info("pick %s | ~$%.2f/day vs the book", m.question[:60], daily)
+    log.info("%d reward markets, %d with books checked, %d picked for $%.2f",
+             len(markets), len(scored), len(out), budget)
     return out
 
 
@@ -86,7 +104,7 @@ def describe(cfg: Config, reader: BookReader, markets) -> None:
             "%s\n    pool $%.0f/day | band Â±%.1fc | min %g sh | competition %.1f | "
             "%.0f days left | est $%.2f/day | needs $%.2f | book %s/%s | quote %s",
             m.question[:90], m.rate_per_day, m.max_spread, m.min_size, m.competition,
-            m.days_left(now) or -1, est_daily(cfg, m), capital_needed(cfg, m),
+            m.days_left(now) or -1, book_daily(cfg, m, top), capital_needed(cfg, m),
             top.best_bid, top.best_ask,
             (f"BUY yes @{q[1]:.3f} + BUY no @{q[2]:.3f} (mid {q[0]:.3f}, "
              f"{quote_distance_c(cfg, m):.1f}c out)") if q else "none",
@@ -165,7 +183,8 @@ def run_live(cfg: Config, http: httpx.Client, reader: BookReader) -> None:
                 next_pick = now + cfg.rw_repick_secs
                 held = {cid for cid, q in quoters.items()
                         if q.yes.shares > 0 or q.no.shares > 0}
-                fresh = {m.condition_id: m for m in choose(cfg, http, budget, reader)}
+                fresh = {m.condition_id: m
+                         for m in choose(cfg, http, budget, reader, current=quoters)}
                 for cid in list(quoters):
                     if cid not in fresh and cid not in held:
                         quoters.pop(cid).pull_all("dropped at re-pick", wait=True)

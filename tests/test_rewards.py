@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pm5.clob import BookTop, Fill, RestingOrder
 from pm5.config import Config
 from pm5.rewards import (
-    MarketQuoter, RewardMarket, capital_needed, order_score, parse_markets, pick, q_min,
+    MAX_SHARE, MarketQuoter, RewardMarket, book_daily, book_share, capital_needed, order_score,
+    parse_markets, pick, q_min,
     quote_distance_c, quote_prices,
 )
 
@@ -51,6 +52,20 @@ def test_quote_both_sides_inside_the_band_without_crossing():
 def test_no_quote_when_the_book_has_no_real_midpoint():
     assert quote_prices(_cfg(), _m(), 0.20, 0.80) is None
     assert quote_prices(_cfg(), _m(), None, 0.5) is None
+
+
+def test_book_share_counts_competition_and_skips_our_own_bids():
+    cfg = _cfg(rw_dist_frac=0.35)
+    m = _m(min_size=20)
+    crowded = BookTop(best_bid=0.49, best_bid_size=500, best_ask=0.51, best_ask_size=500,
+                      bids=[(0.49, 500)], asks=[(0.51, 500)])
+    s = book_share(cfg, m, crowded)
+    assert s is not None and s < 0.05
+    assert abs(book_daily(cfg, m, crowded) - 50 * s) < 1e-9
+    with_us = BookTop(best_bid=0.49, best_bid_size=1, best_ask=0.51, best_ask_size=1,
+                      bids=[(0.49, 1), (0.48, 20)], asks=[(0.51, 1), (0.52, 20)])
+    alone = book_share(cfg, m, with_us, mine=(("yes", 0.48, 20), ("no", 0.48, 20)))
+    assert alone == MAX_SHARE  # only 1-share dust left once our bids are removed
 
 
 def test_pick_respects_budget_days_and_mid():

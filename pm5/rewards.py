@@ -23,12 +23,13 @@ from datetime import datetime, timezone
 
 import httpx
 
-from .clob import BookReader, Fill, RestingOrder
+from .clob import BookReader, BookTop, Fill, RestingOrder
 from .config import Config
 
 log = logging.getLogger("pm5.rewards")
 
 ONE_SIDED_DIVISOR = 3.0
+MAX_SHARE = 0.5
 
 
 @dataclass
@@ -80,15 +81,37 @@ def capital_needed(cfg: Config, m: RewardMarket) -> float:
     return m.min_size * max(0.0, 1.0 - 2 * d)
 
 
-def est_daily(cfg: Config, m: RewardMarket) -> float:
-    """Rough USDC/day if we quote min_size on both sides and others stay put.
-    `competition` is the API's own number; treat the result as a ranking,
-    not a forecast — the live share comes from /rewards/user/percentages."""
-    s = order_score(m.max_spread, quote_distance_c(cfg, m)) * m.min_size
-    q = q_min(s, s, m.mid)
-    if q <= 0:
-        return 0.0
-    return m.rate_per_day * q / (q + max(m.competition, 0.0))
+def book_share(cfg: Config, m: RewardMarket, top: BookTop,
+               mine: tuple[tuple[str, float, float], ...] = ()) -> float | None:
+    """Our expected share of the pool against the resting book, scored the way
+    Polymarket scores it. `mine` = our own ("yes"|"no", price, size) bids, which
+    are in the book and must not count as competition. The API's
+    `market_competitiveness` is not in these units (it ranked a 1% market
+    first at "$40/day")."""
+    q = quote_prices(cfg, m, top.best_bid, top.best_ask)
+    if q is None:
+        return None
+    mid, yes_px, no_px = q
+    bids = sum(order_score(m.max_spread, (mid - p) * 100) * s for p, s in top.bids)
+    asks = sum(order_score(m.max_spread, (p - mid) * 100) * s for p, s in top.asks)
+    for side, p, s in mine:
+        if side == "yes":
+            bids -= order_score(m.max_spread, (mid - p) * 100) * s
+        else:  # a No bid at p is a Yes ask at 1 − p
+            asks -= order_score(m.max_spread, (1 - p - mid) * 100) * s
+    others = q_min(max(bids, 0.0), max(asks, 0.0), mid)
+    ours = q_min(order_score(m.max_spread, (mid - yes_px) * 100) * m.min_size,
+                 order_score(m.max_spread, ((1 - mid) - no_px) * 100) * m.min_size, mid)
+    if ours <= 0:
+        return None
+    # An empty band is a snapshot, not a promise: other makers come back.
+    return min(ours / (ours + others), MAX_SHARE)
+
+
+def book_daily(cfg: Config, m: RewardMarket, top: BookTop,
+               mine: tuple[tuple[str, float, float], ...] = ()) -> float:
+    share = book_share(cfg, m, top, mine)
+    return 0.0 if share is None else m.rate_per_day * share
 
 
 def _end(raw: str | None) -> datetime | None:
@@ -131,8 +154,9 @@ def parse_markets(raw: list[dict]) -> list[RewardMarket]:
 
 def rank(cfg: Config, markets: list[RewardMarket],
          now: datetime | None = None) -> list[RewardMarket]:
-    """Eligible markets, best estimated payer first: far from resolution,
-    with a mid where both sides can be quoted."""
+    """Eligible markets, biggest pool first: far from resolution, with a mid
+    where both sides can be quoted. The real ranking needs the book
+    (`book_daily`)."""
     now = now or datetime.now(timezone.utc)
     ok = []
     for m in markets:
@@ -146,7 +170,7 @@ def rank(cfg: Config, markets: list[RewardMarket],
         if m.min_size > cfg.rw_max_min_size:
             continue
         ok.append(m)
-    ok.sort(key=lambda m: est_daily(cfg, m), reverse=True)
+    ok.sort(key=lambda m: m.rate_per_day, reverse=True)
     return ok
 
 
@@ -270,6 +294,11 @@ class MarketQuoter:
     def live_ids(self) -> list[str]:
         return [s.order.order_id for s in (self.yes, self.no)
                 if s.order is not None and s.order.live and s.order.order_id]
+
+    def mine(self) -> tuple[tuple[str, float, float], ...]:
+        """Our resting bids, as `book_share` wants them."""
+        return tuple((s.name, s.order.price, s.order.size) for s in (self.yes, self.no)
+                     if s.order is not None and not s.order.done)
 
     def _poll(self, s: _Side) -> None:
         if s.order is None:
