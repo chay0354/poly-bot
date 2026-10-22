@@ -21,6 +21,7 @@ import httpx
 from pm5 import net
 from pm5.clob import BookReader
 from pm5.config import Config
+from pm5.supabase_log import SupabaseLog
 from pm5.rewards import (
     MarketQuoter, capital_needed, est_daily, fetch_reward_markets, fill_market_details,
     parse_markets, quote_distance_c, quote_prices, rank,
@@ -92,6 +93,28 @@ def describe(cfg: Config, reader: BookReader, markets) -> None:
         )
 
 
+def _pair_profit(q: MarketQuoter) -> float:
+    """Edge locked in completed pairs: each yes+no pair redeems for $1."""
+    pairs = min(q.yes.shares, q.no.shares)
+    if pairs <= 0:
+        return 0.0
+    return pairs * (1.0 - q.yes.cost / q.yes.shares - q.no.cost / q.no.shares)
+
+
+def _record_fill(sb: SupabaseLog, day_book: dict[str, dict], q: MarketQuoter, f) -> None:
+    now = datetime.now(timezone.utc)
+    day = now.strftime("%Y-%m-%d")
+    d = day_book.setdefault(day, {"yes": 0.0, "no": 0.0, "cost": 0.0, "n": 0})
+    d[f.side] = d.get(f.side, 0.0) + f.size
+    d["cost"] += f.cost
+    d["n"] += 1
+    sb.fill({
+        "ts": now.isoformat(), "mode": "live", "window": f"rewards-{day}",
+        "strategy": "rewards", "side": f.side, "price": f.price, "shares": f.size,
+        "cost": f.cost, "order_id": f.order_id, "maker": True,
+    })
+
+
 def run_live(cfg: Config, http: httpx.Client, reader: BookReader) -> None:
     from pm5.live import LiveTrader
 
@@ -105,6 +128,9 @@ def run_live(cfg: Config, http: httpx.Client, reader: BookReader) -> None:
     markets = choose(cfg, http, budget, reader)
     describe(cfg, reader, markets)
     quoters = {m.condition_id: MarketQuoter(cfg, m, trader, reader) for m in markets}
+    sb = SupabaseLog()
+    seen: dict[str, int] = {}
+    day_book: dict[str, dict] = {}
     next_report = next_pick = time.monotonic()
     next_pick += cfg.rw_repick_secs
     try:
@@ -114,6 +140,9 @@ def run_live(cfg: Config, http: httpx.Client, reader: BookReader) -> None:
                     q.step()
                 except Exception as e:  # noqa: BLE001
                     log.exception("step %s failed: %s", q.label, e)
+                for f in q.fills[seen.get(q.m.condition_id, 0):]:
+                    _record_fill(sb, day_book, q, f)
+                seen[q.m.condition_id] = len(q.fills)
             now = time.monotonic()
             if now >= next_report:
                 next_report = now + cfg.rw_report_secs
@@ -129,6 +158,9 @@ def run_live(cfg: Config, http: httpx.Client, reader: BookReader) -> None:
                              pct.get(q.m.condition_id, 0.0))
                 log.info("rewards credited today (UTC %s): %s", day,
                          f"${earned:.4f}" if earned is not None else "?")
+                d = day_book.get(day, {"yes": 0.0, "no": 0.0, "cost": 0.0, "n": 0})
+                sb.rewards_day(day, earned or 0.0, d["yes"], d["no"], d["cost"], d["n"],
+                               sum(_pair_profit(q) for q in quoters.values()))
             if now >= next_pick:
                 next_pick = now + cfg.rw_repick_secs
                 held = {cid for cid, q in quoters.items()

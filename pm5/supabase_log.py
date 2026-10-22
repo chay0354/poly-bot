@@ -155,6 +155,41 @@ class SupabaseLog:
                     time.sleep(1.5)
         return False
 
+    def rewards_day(self, day: str, earned: float, yes_shares: float, no_shares: float,
+                    cost: float, n_fills: int, pair_profit: float) -> bool:
+        """One `windows` row per UTC day for the liquidity-rewards maker, so the
+        CRM shows it without a schema change. PnL = rewards credited today plus
+        the edge locked in completed pairs; a lone leg is not marked."""
+        if self._sb is None:
+            return False
+        start = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        pnl = round(earned + pair_profit, 4)
+        row = {
+            "ts": now.isoformat(),
+            "mode": "live",
+            "window_slug": f"rewards-{day}",
+            "window_start": int(start.timestamp()),
+            # The CRM lists only rows whose window has ended; keep it at "now".
+            "window_end": int(now.timestamp()) - 2,
+            "traded": True,
+            "n_fills": n_fills,
+            "cost": round(cost, 4),
+            "up_shares": round(yes_shares, 2),
+            "down_shares": round(no_shares, 2),
+            "up_won": None,
+            "window_pnl": pnl,
+            "estimated_pnl": pnl,
+            "result": classify(True, pnl),
+            "strategies": ["rewards"],
+        }
+        try:
+            self._sb.table("windows").upsert(row, on_conflict="mode,window_slug").execute()
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("supabase rewards row failed: %s", e)
+            return False
+
     def live_day_windows(self, day: str) -> list[dict[str, Any]]:
         """Traded live windows whose ts falls on the UTC calendar day."""
         if self._sb is None:
