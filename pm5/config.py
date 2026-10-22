@@ -307,6 +307,24 @@ class Config:
     dog_max_shots: int = field(default_factory=lambda: _i("PM_UNDERDOG_MAX_SHOTS", 3))
     dog_retry_ms: float = field(default_factory=lambda: _f("PM_UNDERDOG_RETRY_MS", 300.0))
 
+    # --- Liquidity-rewards maker (rewards_run.py; not part of run.py) ---
+    rw_budget: float = field(default_factory=lambda: _f("PM_RW_BUDGET", 20.0))
+    rw_max_markets: int = field(default_factory=lambda: _i("PM_RW_MAX_MARKETS", 2))
+    # Both sides quotable and far from a 0/1 snap.
+    rw_min_mid: float = field(default_factory=lambda: _f("PM_RW_MIN_MID", 0.15))
+    rw_max_mid: float = field(default_factory=lambda: _f("PM_RW_MAX_MID", 0.85))
+    # Resolution-day flow is informed; stay away from markets ending soon.
+    rw_min_days: float = field(default_factory=lambda: _f("PM_RW_MIN_DAYS", 14.0))
+    rw_max_min_size: float = field(default_factory=lambda: _f("PM_RW_MAX_MIN_SIZE", 50.0))
+    # Rest this fraction of the reward band away from the mid (≥ 1 tick).
+    rw_dist_frac: float = field(default_factory=lambda: _f("PM_RW_DIST_FRAC", 0.35))
+    rw_requote_cents: float = field(default_factory=lambda: _f("PM_RW_REQUOTE_CENTS", 1.0))
+    rw_jump_cents: float = field(default_factory=lambda: _f("PM_RW_JUMP_CENTS", 3.0))
+    rw_cooldown_secs: float = field(default_factory=lambda: _f("PM_RW_COOLDOWN_SECS", 600.0))
+    rw_poll_secs: float = field(default_factory=lambda: _f("PM_RW_POLL_SECS", 5.0))
+    rw_report_secs: float = field(default_factory=lambda: _f("PM_RW_REPORT_SECS", 60.0))
+    rw_repick_secs: float = field(default_factory=lambda: _f("PM_RW_REPICK_SECS", 3600.0))
+
     # --- Favorite (confirmed 90¢ + breakdown exit) ---
     # Buy a side that has *stayed* at TRIGGER, not the first flicker, and
     # sell on a real breakdown (~0.70) instead of waiting for 0.40.

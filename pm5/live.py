@@ -20,7 +20,7 @@ from py_clob_client_v2 import (
     PartialCreateOrderOptions,
     Side,
 )
-from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams, OrdersScoringParams
 
 from .clob import Fill, PendingTake, RestingOrder, taker_fee_usdc
 from .config import Config
@@ -690,6 +690,49 @@ class LiveTrader:
             if extra is not None:
                 fill = extra
         return fill
+
+    def orders_scoring(self, order_ids: list[str]) -> dict[str, bool]:
+        """Which resting orders currently earn liquidity rewards."""
+        if not order_ids:
+            return {}
+        try:
+            resp = self.client.are_orders_scoring(OrdersScoringParams(orderIds=list(order_ids)))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[LIVE] orders-scoring read failed: %s", e)
+            return {}
+        return {str(k): bool(v) for k, v in resp.items()} if isinstance(resp, dict) else {}
+
+    def reward_percentages(self) -> dict[str, float]:
+        """Our live share (%) of each market's reward pool, by condition id."""
+        try:
+            resp = self.client.get_reward_percentages()
+        except Exception as e:  # noqa: BLE001
+            log.warning("[LIVE] reward-percentages read failed: %s", e)
+            return {}
+        out: dict[str, float] = {}
+        if isinstance(resp, dict):
+            for k, v in resp.items():
+                try:
+                    out[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    def reward_earnings(self, date: str) -> float | None:
+        """Reward USDC credited for `date` (YYYY-MM-DD, UTC)."""
+        try:
+            resp = self.client.get_total_earnings_for_user_for_day(date)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[LIVE] reward-earnings read failed: %s", e)
+            return None
+        rows = resp if isinstance(resp, list) else [resp] if isinstance(resp, dict) else []
+        total = 0.0
+        for r in rows:
+            try:
+                total += float(r.get("earnings") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return total
 
     def _do_cancel(self, order: RestingOrder) -> None:
         try:
