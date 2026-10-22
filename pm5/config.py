@@ -316,6 +316,8 @@ class Config:
     # Resolution-day flow is informed; stay away from markets ending soon.
     rw_min_days: float = field(default_factory=lambda: _f("PM_RW_MIN_DAYS", 14.0))
     rw_max_min_size: float = field(default_factory=lambda: _f("PM_RW_MAX_MIN_SIZE", 50.0))
+    # Leftover budget enlarges the best markets' bids, up to this × min_size.
+    rw_max_size_mult: float = field(default_factory=lambda: _f("PM_RW_MAX_SIZE_MULT", 1.0))
     # Rest this fraction of the reward band away from the mid (≥ 1 tick).
     rw_dist_frac: float = field(default_factory=lambda: _f("PM_RW_DIST_FRAC", 0.35))
     rw_requote_cents: float = field(default_factory=lambda: _f("PM_RW_REQUOTE_CENTS", 1.0))

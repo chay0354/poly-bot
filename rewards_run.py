@@ -90,6 +90,14 @@ def choose(cfg: Config, http: httpx.Client, budget: float, reader: BookReader,
             out.append(m)
             left -= need
             log.info("pick %s | ~$%.2f/day vs the book", m.question[:60], daily)
+    for m in out:  # best first: leftover budget makes its bids bigger
+        per_share = capital_needed(cfg, m) / m.size
+        cap = m.min_size * max(cfg.rw_max_size_mult, 1.0)
+        extra = min(cap - m.size, left / per_share) if per_share > 0 else 0.0
+        if extra >= 1:
+            m.quote_size = m.size + int(extra)
+            left -= int(extra) * per_share
+            log.info("size %s → %g sh", m.question[:60], m.quote_size)
     log.info("%d reward markets, %d with books checked, %d picked for $%.2f",
              len(markets), len(scored), len(out), budget)
     return out

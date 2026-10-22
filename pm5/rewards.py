@@ -47,6 +47,11 @@ class RewardMarket:
     volume_24h: float = 0.0
     tick: float = 0.01
     neg_risk: bool = False
+    quote_size: float = 0.0  # shares per bid; 0 = min_size
+
+    @property
+    def size(self) -> float:
+        return max(self.quote_size, self.min_size)
 
     def days_left(self, now: datetime) -> float | None:
         if self.end is None:
@@ -78,7 +83,7 @@ def quote_distance_c(cfg: Config, m: RewardMarket) -> float:
 def capital_needed(cfg: Config, m: RewardMarket) -> float:
     """USDC two resting bids reserve: size · (yes bid + no bid)."""
     d = quote_distance_c(cfg, m) / 100
-    return m.min_size * max(0.0, 1.0 - 2 * d)
+    return m.size * max(0.0, 1.0 - 2 * d)
 
 
 def book_share(cfg: Config, m: RewardMarket, top: BookTop,
@@ -100,8 +105,8 @@ def book_share(cfg: Config, m: RewardMarket, top: BookTop,
         else:  # a No bid at p is a Yes ask at 1 − p
             asks -= order_score(m.max_spread, (1 - p - mid) * 100) * s
     others = q_min(max(bids, 0.0), max(asks, 0.0), mid)
-    ours = q_min(order_score(m.max_spread, (mid - yes_px) * 100) * m.min_size,
-                 order_score(m.max_spread, ((1 - mid) - no_px) * 100) * m.min_size, mid)
+    ours = q_min(order_score(m.max_spread, (mid - yes_px) * 100) * m.size,
+                 order_score(m.max_spread, ((1 - mid) - no_px) * 100) * m.size, mid)
     if ours <= 0:
         return None
     # An empty band is a snapshot, not a promise: other makers come back.
@@ -328,7 +333,7 @@ class MarketQuoter:
     def _may_quote(self, s: _Side) -> bool:
         """Do not add to a lone leg: one fill per side until it is paired."""
         other = self.no if s is self.yes else self.yes
-        return s.shares - other.shares < self.m.min_size * 0.5
+        return s.shares - other.shares < self.m.size * 0.5
 
     def step(self) -> None:
         now = self.clock()
@@ -355,11 +360,12 @@ class MarketQuoter:
             if o is not None and not o.done:
                 if o.cancelling or o.pending is not None:
                     continue
-                if abs(o.price - px) * 100 >= self.cfg.rw_requote_cents - 1e-9:
+                if (abs(o.price - px) * 100 >= self.cfg.rw_requote_cents - 1e-9
+                        or abs(o.size - self.m.size) >= 1):
                     self._pull(s)
                 continue
             s.order = self.trader.place_bid(
-                s.token, s.name, px, self.m.min_size, self.m.tick, self.m.neg_risk,
+                s.token, s.name, px, self.m.size, self.m.tick, self.m.neg_risk,
             )
 
     def summary(self) -> str:
