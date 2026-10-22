@@ -30,6 +30,8 @@ log = logging.getLogger("pm5.rewards")
 
 ONE_SIDED_DIVISOR = 3.0
 MAX_SHARE = 0.5
+PAIR_MIN_SHARES = 5.0  # CLOB minimum order size
+FAIL_BACKOFF_SECS = 60.0
 
 
 @dataclass
@@ -86,6 +88,28 @@ def capital_needed(cfg: Config, m: RewardMarket) -> float:
     return m.size * max(0.0, 1.0 - 2 * d)
 
 
+def strip_mine(top: BookTop, mine: tuple[tuple[str, float, float], ...]) -> BookTop:
+    """The Yes book without our own bids (a No bid at p rests as a Yes ask at
+    1 − p). A mid that includes our quote chases itself: we requote, the mid
+    moves, we requote again."""
+    if not mine or not (top.bids or top.asks):
+        return top
+    bids, asks = list(top.bids), list(top.asks)
+    for side, p, s in mine:
+        levels, px = (bids, p) if side == "yes" else (asks, round(1 - p, 4))
+        for i, (lp, ls) in enumerate(levels):
+            if abs(lp - px) < 1e-6:
+                levels[i] = (lp, ls - s)
+                break
+    bids = [(p, s) for p, s in bids if s > 1e-6]
+    asks = [(p, s) for p, s in asks if s > 1e-6]
+    return BookTop(
+        best_bid=bids[0][0] if bids else None, best_bid_size=bids[0][1] if bids else 0.0,
+        best_ask=asks[0][0] if asks else None, best_ask_size=asks[0][1] if asks else 0.0,
+        bids=bids, asks=asks, source=top.source,
+    )
+
+
 def book_share(cfg: Config, m: RewardMarket, top: BookTop,
                mine: tuple[tuple[str, float, float], ...] = ()) -> float | None:
     """Our expected share of the pool against the resting book, scored the way
@@ -93,18 +117,14 @@ def book_share(cfg: Config, m: RewardMarket, top: BookTop,
     are in the book and must not count as competition. The API's
     `market_competitiveness` is not in these units (it ranked a 1% market
     first at "$40/day")."""
+    top = strip_mine(top, mine)
     q = quote_prices(cfg, m, top.best_bid, top.best_ask)
     if q is None:
         return None
     mid, yes_px, no_px = q
     bids = sum(order_score(m.max_spread, (mid - p) * 100) * s for p, s in top.bids)
     asks = sum(order_score(m.max_spread, (p - mid) * 100) * s for p, s in top.asks)
-    for side, p, s in mine:
-        if side == "yes":
-            bids -= order_score(m.max_spread, (mid - p) * 100) * s
-        else:  # a No bid at p is a Yes ask at 1 − p
-            asks -= order_score(m.max_spread, (1 - p - mid) * 100) * s
-    others = q_min(max(bids, 0.0), max(asks, 0.0), mid)
+    others = q_min(bids, asks, mid)
     ours = q_min(order_score(m.max_spread, (mid - yes_px) * 100) * m.size,
                  order_score(m.max_spread, ((1 - mid) - no_px) * 100) * m.size, mid)
     if ours <= 0:
@@ -270,6 +290,7 @@ class _Side:
     order: RestingOrder | None = None
     shares: float = 0.0
     cost: float = 0.0
+    retry_at: float = 0.0
 
 
 @dataclass
@@ -286,6 +307,7 @@ class MarketQuoter:
     last_mid: float | None = None
     last_mid_at: float = 0.0
     cooldown_until: float = 0.0
+    pair_only: bool = False  # dropped at re-pick but still holds a lone leg
     fills: list[Fill] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -335,37 +357,67 @@ class MarketQuoter:
         other = self.no if s is self.yes else self.yes
         return s.shares - other.shares < self.m.size * 0.5
 
+    def _pair_target(self, top: BookTop) -> tuple[str, float, float] | None:
+        """(side, price, shares) of a bid that pairs a lone leg at ≥ 1 tick
+        profit: it rests even when the book is too thin to quote for rewards."""
+        if self.yes.shares - self.no.shares >= 1:
+            lone, short = self.yes, self.no
+        elif self.no.shares - self.yes.shares >= 1:
+            lone, short = self.no, self.yes
+        else:
+            return None
+        tick = self.m.tick
+        px = _floor_tick(1 - lone.cost / lone.shares - tick, tick)
+        if short is self.yes and top.best_ask is not None:
+            px = min(px, round(top.best_ask - tick, 4))
+        if short is self.no and top.best_bid is not None:
+            px = min(px, round(1 - top.best_bid - tick, 4))
+        if px < tick:
+            return None
+        return short.name, px, max(round(lone.shares - short.shares, 2), PAIR_MIN_SHARES)
+
     def step(self) -> None:
         now = self.clock()
         for s in (self.yes, self.no):
             self._poll(s)
-        top = self.reader.top(self.m.yes_token)
+            if s.order is not None and s.order.failed:
+                s.order, s.retry_at = None, now + FAIL_BACKOFF_SECS
+        top = strip_mine(self.reader.top(self.m.yes_token), self.mine())
         q = quote_prices(self.cfg, self.m, top.best_bid, top.best_ask)
-        if q is None:
-            self.pull_all("no quotable midpoint")
-            return
-        mid, yes_px, no_px = q
-        if self.last_mid is not None and abs(mid - self.last_mid) * 100 >= self.cfg.rw_jump_cents:
-            self.cooldown_until = now + self.cfg.rw_cooldown_secs
-            self.pull_all(f"mid jumped {self.last_mid:.3f} → {mid:.3f}; cooling "
-                          f"{self.cfg.rw_cooldown_secs:.0f}s")
-        self.last_mid, self.last_mid_at = mid, now
-        if now < self.cooldown_until:
-            return
-        for s, px in ((self.yes, yes_px), (self.no, no_px)):
-            o = s.order
-            if not self._may_quote(s):
+        targets: dict[str, tuple[float, float]] = {}
+        if q is not None:
+            mid, yes_px, no_px = q
+            if (self.last_mid is not None
+                    and abs(mid - self.last_mid) * 100 >= self.cfg.rw_jump_cents):
+                self.cooldown_until = now + self.cfg.rw_cooldown_secs
+                self.pull_all(f"mid jumped {self.last_mid:.3f} → {mid:.3f}; cooling "
+                              f"{self.cfg.rw_cooldown_secs:.0f}s")
+            self.last_mid, self.last_mid_at = mid, now
+            if now >= self.cooldown_until and not self.pair_only:
+                targets = {"yes": (yes_px, self.m.size), "no": (no_px, self.m.size)}
+        pair = self._pair_target(top)
+        if pair is not None:
+            name, px, size = pair
+            cur = targets.get(name)
+            targets[name] = (min(cur[0], px), cur[1]) if cur else (px, size)
+        for s in (self.yes, self.no):
+            t = targets.get(s.name)
+            if t is None or not self._may_quote(s):
                 self._pull(s)
                 continue
+            px, size = t
+            o = s.order
             if o is not None and not o.done:
                 if o.cancelling or o.pending is not None:
                     continue
                 if (abs(o.price - px) * 100 >= self.cfg.rw_requote_cents - 1e-9
-                        or abs(o.size - self.m.size) >= 1):
+                        or abs(o.size - size) >= 1):
                     self._pull(s)
                 continue
+            if now < s.retry_at:
+                continue
             s.order = self.trader.place_bid(
-                s.token, s.name, px, self.m.size, self.m.tick, self.m.neg_risk,
+                s.token, s.name, px, size, self.m.tick, self.m.neg_risk,
             )
 
     def summary(self) -> str:

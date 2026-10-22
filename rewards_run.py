@@ -23,7 +23,7 @@ from pm5.clob import BookReader
 from pm5.config import Config
 from pm5.supabase_log import SupabaseLog
 from pm5.rewards import (
-    MarketQuoter, book_daily, capital_needed, fetch_reward_markets, fill_market_details,
+    MarketQuoter, RewardMarket, book_daily, capital_needed, fetch_reward_markets, fill_market_details,
     parse_markets, quote_distance_c, quote_prices, rank,
 )
 
@@ -141,6 +141,82 @@ def _record_fill(sb: SupabaseLog, day_book: dict[str, dict], q: MarketQuoter, f)
     })
 
 
+def _free_budget(cfg: Config, trader, quoters: dict) -> float:
+    """Cash for new two-sided quotes: the CLOB balance (which still counts our
+    resting bids) minus what pairing-only bids need, capped by the budget."""
+    bal, _ = trader.sync_collateral()
+    if bal is None:
+        return 0.0
+    reserved = 0.0
+    for q in quoters.values():
+        if not q.pair_only:
+            continue
+        lone, short = (q.yes, q.no) if q.yes.shares > q.no.shares else (q.no, q.yes)
+        if lone.shares > 0:
+            reserved += (lone.shares - short.shares) * max(0.0, 1 - lone.cost / lone.shares)
+    free = max(0.0, min(cfg.rw_budget, bal - reserved))
+    log.info("cash $%.2f, pairing bids need $%.2f, free for quoting $%.2f", bal, reserved, free)
+    return free
+
+
+def load_positions(cfg: Config, http: httpx.Client, trader, reader: BookReader) -> dict:
+    """Pairing-only quoters for lone legs held from an earlier run, so a
+    restart does not forget inventory."""
+    user = cfg.funder_address or getattr(trader, "address", "")
+    out: dict = {}
+    if not user:
+        return out
+    try:
+        r = http.get("https://data-api.polymarket.com/positions",
+                     params={"user": user, "sizeThreshold": 1, "limit": 500})
+        r.raise_for_status()
+        rows = r.json()
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("positions read failed: %s", e)
+        return out
+    by_cid: dict[str, list] = {}
+    for p in rows:
+        if p.get("redeemable") or float(p.get("curPrice") or 0) in (0.0, 1.0):
+            continue
+        by_cid.setdefault(p.get("conditionId"), []).append(p)
+    for cid, ps in by_cid.items():
+        try:
+            j = http.get(f"{cfg.clob_url}/markets/{cid}").json()
+        except (httpx.HTTPError, ValueError):
+            continue
+        toks = j.get("tokens") or []
+        rw = j.get("rewards") or {}
+        if len(toks) != 2 or j.get("closed") or not rw.get("rates"):
+            continue
+        yes = next((t for t in toks if str(t.get("outcome", "")).lower() == "yes"), toks[0])
+        no = toks[1] if yes is toks[0] else toks[0]
+        m = RewardMarket(
+            condition_id=cid, question=str(j.get("question") or ""),
+            yes_token=str(yes["token_id"]), no_token=str(no["token_id"]),
+            mid=float(yes.get("price") or 0.5), max_spread=float(rw.get("max_spread") or 0),
+            min_size=float(rw.get("min_size") or 0),
+            rate_per_day=sum(float(x.get("rewards_daily_rate") or 0) for x in rw["rates"]),
+            competition=0.0, end=None, tick=float(j.get("minimum_tick_size") or 0.01),
+            neg_risk=bool(j.get("neg_risk")),
+        )
+        q = MarketQuoter(cfg, m, trader, reader, pair_only=True)
+        for p in ps:
+            side = q.yes if str(p.get("asset")) == m.yes_token else q.no
+            side.shares += float(p.get("size") or 0)
+            side.cost += float(p.get("size") or 0) * float(p.get("avgPrice") or 0)
+        # The wallet may hold the owner's own positions: only adopt legs no
+        # bigger than one of our bids could have bought.
+        biggest = m.min_size * max(cfg.rw_max_size_mult, 1.0) + 1e-6
+        if max(q.yes.shares, q.no.shares) > biggest:
+            log.info("not ours (too big), leaving alone: %s", q.label)
+            continue
+        if abs(q.yes.shares - q.no.shares) >= 1:
+            out[cid] = q
+            log.info("holding %s | yes %.1f sh $%.2f no %.1f sh $%.2f", q.label,
+                     q.yes.shares, q.yes.cost, q.no.shares, q.no.cost)
+    return out
+
+
 def run_live(cfg: Config, http: httpx.Client, reader: BookReader) -> None:
     from pm5.live import LiveTrader
 
@@ -149,11 +225,15 @@ def run_live(cfg: Config, http: httpx.Client, reader: BookReader) -> None:
     if trader.geoblocked:
         log.error("geoblocked: not quoting")
         return
-    bal, _ = trader.sync_collateral()
-    budget = min(cfg.rw_budget, bal) if bal is not None else cfg.rw_budget
-    markets = choose(cfg, http, budget, reader)
+    quoters = load_positions(cfg, http, trader, reader)
+    markets = choose(cfg, http, _free_budget(cfg, trader, quoters), reader)
     describe(cfg, reader, markets)
-    quoters = {m.condition_id: MarketQuoter(cfg, m, trader, reader) for m in markets}
+    for m in markets:
+        q = quoters.get(m.condition_id)
+        if q is not None:
+            q.pair_only = False
+        else:
+            quoters[m.condition_id] = MarketQuoter(cfg, m, trader, reader)
     sb = SupabaseLog()
     seen: dict[str, int] = {}
     day_book: dict[str, dict] = {}
@@ -189,15 +269,20 @@ def run_live(cfg: Config, http: httpx.Client, reader: BookReader) -> None:
                                sum(_pair_profit(q) for q in quoters.values()))
             if now >= next_pick:
                 next_pick = now + cfg.rw_repick_secs
-                held = {cid for cid, q in quoters.items()
-                        if q.yes.shares > 0 or q.no.shares > 0}
-                fresh = {m.condition_id: m
-                         for m in choose(cfg, http, budget, reader, current=quoters)}
-                for cid in list(quoters):
-                    if cid not in fresh and cid not in held:
+                active = {cid: q for cid, q in quoters.items() if not q.pair_only}
+                fresh = {m.condition_id: m for m in choose(
+                    cfg, http, _free_budget(cfg, trader, quoters), reader, current=active)}
+                for cid, q in list(quoters.items()):
+                    if cid in fresh:
+                        q.pair_only = False
+                    elif abs(q.yes.shares - q.no.shares) >= 1:
+                        if not q.pair_only:
+                            log.info("%s: dropped at re-pick; only pairing its lone leg", q.label)
+                        q.pair_only = True
+                    else:
                         quoters.pop(cid).pull_all("dropped at re-pick", wait=True)
                 for cid, m in fresh.items():
-                    if cid not in quoters and len(quoters) < cfg.rw_max_markets:
+                    if cid not in quoters:
                         quoters[cid] = MarketQuoter(cfg, m, trader, reader)
             time.sleep(cfg.rw_poll_secs)
     finally:

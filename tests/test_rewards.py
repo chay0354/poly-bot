@@ -137,6 +137,64 @@ def test_quoter_posts_both_sides_then_stops_adding_to_a_lone_fill():
     assert q.no.order is not None and q.no.order.live    # still pairing
 
 
+class _BookReader:
+    """A book with levels, where our own bids show up like anyone's."""
+
+    def __init__(self, bids, asks, trader):
+        self.bids, self.asks, self.t = bids, asks, trader
+
+    def top(self, token):
+        bids, asks = list(self.bids), list(self.asks)
+        for o in self.t.placed:
+            if not o.done:
+                if o.side == "yes":
+                    bids.append((o.price, o.size))
+                else:
+                    asks.append((round(1 - o.price, 4), o.size))
+        bids.sort(reverse=True)
+        asks.sort()
+        return BookTop(bids[0][0] if bids else None, bids[0][1] if bids else 0,
+                       asks[0][0] if asks else None, asks[0][1] if asks else 0,
+                       bids=bids, asks=asks)
+
+
+def test_our_own_bids_do_not_move_the_mid_we_quote_around():
+    cfg = _cfg(rw_dist_frac=0.15, rw_jump_cents=3)
+    t = _Trader()
+    q = MarketQuoter(cfg, _m(max_spread=6.5), t, _BookReader([(0.40, 50)], [(0.50, 50)], t),
+                     clock=lambda: 0.0)
+    q.step()
+    assert len(t.placed) == 2  # yes 0.44, no 0.54 — both inside the old spread
+    for _ in range(5):
+        q.step()
+    assert len(t.placed) == 2  # no chase: the mid is read without our quotes
+
+
+def test_lone_leg_rests_a_profitable_pairing_bid_even_on_a_thin_book():
+    cfg = _cfg(rw_dist_frac=0.35)
+    t = _Trader()
+    q = MarketQuoter(cfg, _m(), t, _BookReader([(0.10, 5)], [(0.40, 5)], t),
+                     clock=lambda: 0.0, pair_only=True)
+    q.yes.shares, q.yes.cost = 10, 2.9  # bought yes at 0.29
+    q.step()
+    assert [(o.side, o.price, o.size) for o in t.placed] == [("no", 0.7, 10)]
+
+
+def test_rejected_bid_waits_before_reposting():
+    cfg = _cfg(rw_dist_frac=0.35)
+    t = _Trader()
+    clock = [0.0]
+    q = MarketQuoter(cfg, _m(), t, _Reader(0.49, 0.51), clock=lambda: clock[0])
+    q.step()
+    for o in t.placed:
+        o.failed = o.done = True
+    q.step()
+    assert len(t.placed) == 2
+    clock[0] = 61.0
+    q.step()
+    assert len(t.placed) == 4
+
+
 def test_quoter_pulls_everything_on_a_jump_and_cools_down():
     cfg = _cfg(rw_dist_frac=0.35, rw_jump_cents=3, rw_cooldown_secs=600)
     t = _Trader()
